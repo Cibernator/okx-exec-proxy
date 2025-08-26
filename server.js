@@ -16,7 +16,6 @@ app.use(express.json());
 
 // ---------------- Utils ----------------
 async function okxTimestampIso() {
-  // Hora oficial de OKX para evitar skew
   const r = await axios.get(`${OKX_BASE}/api/v5/public/time`);
   const ms = Number(r.data?.data?.[0]?.ts || Date.now());
   return new Date(ms).toISOString();
@@ -29,11 +28,9 @@ function okxSign({ timestamp, method, requestPath, body = "" }) {
 }
 
 async function okxReq(method, path, bodyObj) {
-  // Validaciones tempranas para errores claros
   if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
     throw new Error("Missing OKX credentials (OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE)");
   }
-
   const ts = await okxTimestampIso();
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
 
@@ -47,16 +44,14 @@ async function okxReq(method, path, bodyObj) {
   if (OKX_PAPER === "1") headers["x-simulated-trading"] = "1";
 
   const url = `${OKX_BASE}${path}`;
+  const cfg = { method, url, headers, data: bodyStr || undefined, timeout: 15000 };
   try {
-    const res = await axios({ method, url, headers, data: bodyStr || undefined, timeout: 15000 });
+    const res = await axios(cfg);
     return res.data;
   } catch (err) {
-    // Log detallado para depurar rápido
     const status = err?.response?.status;
     const data = err?.response?.data;
-    console.error("OKX HTTP ERROR →", {
-      method, path, status, data, message: err.message
-    });
+    console.error("OKX HTTP ERROR →", { method, path, status, data, message: err.message });
     throw err;
   }
 }
@@ -64,51 +59,35 @@ async function okxReq(method, path, bodyObj) {
 // ---------------- Endpoints ----------------
 app.get("/ping", (_req, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
 
-// Diagnóstico rápido de entorno (NO expone valores)
-app.get("/debug/env", (_req, res) => {
-  res.json({
-    hasKey: !!OKX_API_KEY,
-    hasSecret: !!OKX_API_SECRET,
-    hasPassphrase: !!OKX_API_PASSPHRASE,
-    paper: OKX_PAPER
-  });
+// Diagnóstico
+app.get("/account/config", async (_req, res, next) => {
+  try { const data = await okxReq("GET", "/api/v5/account/config"); res.json(data); }
+  catch (e) { next(e); }
+});
+app.get("/account/balance", async (req, res, next) => {
+  try {
+    const ccy = req.query.ccy || "USDT";
+    const data = await okxReq("GET", `/api/v5/account/balance?ccy=${encodeURIComponent(ccy)}`);
+    res.json(data);
+  } catch (e) { next(e); }
 });
 
 // 1) positions (futuros/swap)
 app.post("/positions", async (req, res, next) => {
   try {
-    if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
-      });
-    }
     const { instId } = req.body;
     if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
-
     const path = `/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`;
     const data = await okxReq("GET", path);
-
     const arr = Array.isArray(data?.data) ? data.data : [];
     const netSz = arr.reduce((sum, p) => sum + Number(p.pos || "0"), 0);
-
     res.json({ ok: true, instId, open: Math.abs(netSz) > 0, netPosSz: netSz, raw: data });
-  } catch (err) {
-    console.error("positions error:", err?.response?.data || err.message);
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
 // 2) order (abrir posición con leverage y TP/SL opcional)
 app.post("/order", async (req, res, next) => {
   try {
-    if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
-      });
-    }
-
     const {
       instId, side, sz,
       ordType = "market",
@@ -117,24 +96,21 @@ app.post("/order", async (req, res, next) => {
       leverage,
       tpTriggerPx, tpOrdPx,
       slTriggerPx, slOrdPx,
-      posSide // recuerda: en NET mode no se envía
+      posSide
     } = req.body;
 
     if (!instId || !side || !sz) {
       return res.status(400).json({ ok: false, error: "instId, side, sz are required" });
     }
 
-    // --- Intentar setear leverage: SOFT-FAIL ---
+    // Soft-fail leverage
     let leverageNote = null;
     if (leverage) {
       try {
         await okxReq("POST", "/api/v5/account/set-leverage", {
-          instId,
-          lever: String(leverage),
-          mgnMode: tdMode
+          instId, lever: String(leverage), mgnMode: tdMode
         });
       } catch (e) {
-        // No detengas la orden si falla set-leverage
         const status = e?.response?.status;
         const data = e?.response?.data;
         console.error("set-leverage failed (soft):", { status, data });
@@ -144,13 +120,12 @@ app.post("/order", async (req, res, next) => {
 
     const body = {
       instId,
-      side,                    // "buy" | "sell"
-      ordType,                 // "market" | "limit" | ...
-      tdMode,                  // "cross" | "isolated"
+      side,
+      ordType,
+      tdMode,
       sz: String(sz),
       ...(px ? { px: String(px) } : {}),
-      // En NET mode NO incluir posSide
-      ...(posSide ? { posSide } : {}),
+      ...(posSide ? { posSide } : {}), // en NET no se envía
       ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
       ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
       ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
@@ -159,12 +134,44 @@ app.post("/order", async (req, res, next) => {
 
     const data = await okxReq("POST", "/api/v5/trade/order", body);
     res.json({ ok: true, request: body, response: data, leverageNote });
-  } catch (err) {
-    console.error("order error:", err?.response?.data || err.message);
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
+// 3) close (cerrar posición abierta del instrumento)
+app.post("/close", async (req, res, next) => {
+  try {
+    const { instId, tdMode = "cross", posSide } = req.body;
+    if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
+
+    const body = { instId, mgnMode: tdMode, ...(posSide ? { posSide } : {}) };
+    const data = await okxReq("POST", "/api/v5/trade/close-position", body);
+    res.json({ ok: true, request: body, response: data });
+  } catch (err) { next(err); }
+});
+
+// 4) amend-tpsl (set o modificar TP/SL sobre la posición)
+app.post("/amend-tpsl", async (req, res, next) => {
+  try {
+    const { instId, tdMode = "cross", tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body;
+    if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
+    if (!tpTriggerPx && !slTriggerPx) {
+      return res.status(400).json({ ok: false, error: "Provide at least one of tpTriggerPx or slTriggerPx" });
+    }
+
+    const body = {
+      instId,
+      mgnMode: tdMode,
+      ...(posSide ? { posSide } : {}), // en NET no se envía
+      ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
+      ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
+      ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
+      ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {})
+    };
+
+    const data = await okxReq("POST", "/api/v5/trade/tpsl", body);
+    res.json({ ok: true, request: body, response: data });
+  } catch (err) { next(err); }
+});
 
 // Error handler
 app.use((err, _req, res, _next) => {
@@ -172,20 +179,3 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => console.log(`okx-exec-proxy running on :${PORT}`));
-
-// === Diagnóstico de cuenta ===
-// 1) Configuración de cuenta (posMode, etc.)
-app.get("/account/config", async (_req, res, next) => {
-  try {
-    const data = await okxReq("GET", "/api/v5/account/config");
-    res.json({ ok: true, data });
-  } catch (err) { next(err); }
-});
-
-// 2) Balance (USDT en cuenta de contratos)
-app.get("/account/balance", async (_req, res, next) => {
-  try {
-    const data = await okxReq("GET", "/api/v5/account/balance?ccy=USDT");
-    res.json({ ok: true, data });
-  } catch (err) { next(err); }
-});

@@ -1,43 +1,48 @@
-# okx-exec-proxy
+# okx-exec-proxy (v3)
 
-Proxy mínimo para operar Futuros/Swap en OKX desde Make/n8n o cualquier cliente HTTP.
+Proxy para operar Futuros/Swap en OKX desde Make/Render.
 Incluye:
-- `/positions`  → revisa si hay posición abierta (usa `instType=SWAP`)
-- `/order`      → abre posición con leverage y TP/SL opcional
-
-## Variables de entorno
-- `OKX_API_KEY`
-- `OKX_API_SECRET`
-- `OKX_API_PASSPHRASE`
-- `OKX_PAPER` (1 = Paper trading, 0 = real)
-- `PORT`
+- `POST /positions`  → revisa si hay posición abierta (usa `instType=SWAP`)
+- `POST /order`      → abre posición (market/limit) con leverage y TP/SL opcional
+- `POST /close`      → cierra posición abierta del instrumento (usa `trade/close-position`)
+- `POST /amend-tpsl` → coloca/modifica TP/SL sobre la posición (usa `trade/tpsl`)
+- `GET  /account/config` → ver `posMode` (net/long_short), etc.
+- `GET  /account/balance?ccy=USDT` → ver balance de contratos
 
 ## Ejemplos
 
-### Ping
-```
-GET /ping
-```
-
-### Check posiciones
-```
-POST /positions
-{ "instId": "BTC-USDT-SWAP" }
-```
-
-### Abrir orden de prueba (market, cross, con TP/SL a mercado)
+### Abrir orden (NET mode, sin `posSide`)
 ```
 POST /order
 {
   "instId": "BTC-USDT-SWAP",
   "side": "buy",
-  "sz": "1",
+  "sz": "186",
   "tdMode": "cross",
   "ordType": "market",
-  "leverage": "10",
-  "tpTriggerPx": "63000",
+  "leverage": "3",
+  "tpTriggerPx": "110440",
   "tpOrdPx": "-1",
-  "slTriggerPx": "59000",
+  "slTriggerPx": "109780",
+  "slOrdPx": "-1"
+}
+```
+
+### Cerrar posición (NET mode)
+```
+POST /close
+{ "instId": "BTC-USDT-SWAP", "tdMode": "cross" }
+```
+
+### Colocar/Modificar TP/SL
+```
+POST /amend-tpsl
+{
+  "instId": "BTC-USDT-SWAP",
+  "tdMode": "cross",
+  "tpTriggerPx": "110440",
+  "tpOrdPx": "-1",
+  "slTriggerPx": "109780",
   "slOrdPx": "-1"
 }
 ```
