@@ -109,44 +109,62 @@ app.post("/order", async (req, res, next) => {
       });
     }
 
-    const { instId, side, sz, ordType = "market", tdMode = "cross", px,
-            leverage, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body;
+    const {
+      instId, side, sz,
+      ordType = "market",
+      tdMode = "cross",
+      px,
+      leverage,
+      tpTriggerPx, tpOrdPx,
+      slTriggerPx, slOrdPx,
+      posSide // recuerda: en NET mode no se envía
+    } = req.body;
 
     if (!instId || !side || !sz) {
       return res.status(400).json({ ok: false, error: "instId, side, sz are required" });
     }
 
-    // (Opcional) set leverage antes de la orden
+    // --- Intentar setear leverage: SOFT-FAIL ---
+    let leverageNote = null;
     if (leverage) {
-      await okxReq("POST", "/api/v5/account/set-leverage", {
-        instId, lever: String(leverage), mgnMode: tdMode
-      });
+      try {
+        await okxReq("POST", "/api/v5/account/set-leverage", {
+          instId,
+          lever: String(leverage),
+          mgnMode: tdMode
+        });
+      } catch (e) {
+        // No detengas la orden si falla set-leverage
+        const status = e?.response?.status;
+        const data = e?.response?.data;
+        console.error("set-leverage failed (soft):", { status, data });
+        leverageNote = { note: "set-leverage failed; proceeding without changing leverage", status, data };
+      }
     }
 
     const body = {
       instId,
-      side,                     // "buy" | "sell"
-      ordType,                  // "market" | "limit" | "post_only" | ...
-      tdMode,                   // "cross" | "isolated"
+      side,                    // "buy" | "sell"
+      ordType,                 // "market" | "limit" | ...
+      tdMode,                  // "cross" | "isolated"
       sz: String(sz),
       ...(px ? { px: String(px) } : {}),
+      // En NET mode NO incluir posSide
       ...(posSide ? { posSide } : {}),
       ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
       ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
       ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
-      ...(slOrdPx ? { slOrdPx: String(slOrdLvOrdPx) } : {}) // typo intencional? No → corregido abajo
+      ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {})
     };
 
-    // CORRECCIÓN: slOrdPx real
-    if (slOrdPx) body.slOrdPx = String(slOrdPx);
-
     const data = await okxReq("POST", "/api/v5/trade/order", body);
-    res.json({ ok: true, request: body, response: data });
+    res.json({ ok: true, request: body, response: data, leverageNote });
   } catch (err) {
     console.error("order error:", err?.response?.data || err.message);
     next(err);
   }
 });
+
 
 // Error handler
 app.use((err, _req, res, _next) => {
@@ -171,4 +189,3 @@ app.get("/account/balance", async (_req, res, next) => {
     res.json({ ok: true, data });
   } catch (err) { next(err); }
 });
-
