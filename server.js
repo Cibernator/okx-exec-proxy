@@ -1,3 +1,4 @@
+// server.js (con logs y normalización de body)
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
@@ -12,7 +13,62 @@ const {
 
 const OKX_BASE = "https://www.okx.com";
 const app = express();
-app.use(express.json());
+
+// --- Captura raw para debug y parseo robusto ---
+app.use(express.text({ type: ["text/*"], limit: "1mb" }));
+app.use(express.json({ limit: "1mb" }));
+
+// Middleware: normaliza body si vino como string con JSON
+app.use((req, _res, next) => {
+  try {
+    // Solo para métodos con body
+    if (["POST", "PUT", "PATCH"].includes(req.method)) {
+      // Si Content-Type dice JSON pero body es string, intenta parsear
+      const ct = (req.headers["content-type"] || "").toLowerCase();
+      if (typeof req.body === "string") {
+        const looksJson =
+          ct.includes("application/json") ||
+          (req.body.trim().startsWith("{") && req.body.trim().endsWith("}"));
+        if (looksJson) {
+          try {
+            const parsed = JSON.parse(req.body);
+            req.body = parsed;
+            req._bodyWasString = true;
+          } catch (e) {
+            // Deja el string tal cual; el handler devolverá error útil
+            req._jsonParseError = String(e.message || e);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    req._normalizerError = String(e.message || e);
+  }
+  next();
+});
+
+// Logger compacto de cada request entrante
+app.use((req, _res, next) => {
+  const ct = req.headers["content-type"];
+  console.log("▶︎ INCOMING",
+    JSON.stringify({
+      method: req.method,
+      url: req.url,
+      contentType: ct,
+      bodyType: typeof req.body,
+      bodyWasString: !!req._bodyWasString,
+      jsonParseError: req._jsonParseError || null
+    })
+  );
+  // Log del body (recortado a 8k para no saturar logs)
+  try {
+    const toPrint =
+      typeof req.body === "string" ? req.body :
+      typeof req.body === "object" ? JSON.stringify(req.body) : String(req.body);
+    console.log("   body:", toPrint.slice(0, 8000));
+  } catch {}
+  next();
+});
 
 // ---------------- Utils ----------------
 async function okxTimestampIso() {
@@ -45,13 +101,16 @@ async function okxReq(method, path, bodyObj) {
 
   const url = `${OKX_BASE}${path}`;
   const cfg = { method, url, headers, data: bodyStr || undefined, timeout: 15000 };
+
+  console.log("→ OKX REQ", JSON.stringify({ method, path, body: bodyObj || null }).slice(0, 8000));
   try {
     const res = await axios(cfg);
+    console.log("← OKX RES", JSON.stringify(res.data).slice(0, 8000));
     return res.data;
   } catch (err) {
     const status = err?.response?.status;
     const data = err?.response?.data;
-    console.error("OKX HTTP ERROR →", { method, path, status, data, message: err.message });
+    console.error("⛔ OKX ERROR", JSON.stringify({ status, data, message: err.message }).slice(0, 8000));
     throw err;
   }
 }
@@ -76,7 +135,7 @@ app.get("/account/balance", async (req, res, next) => {
 app.post("/positions", async (req, res, next) => {
   try {
     const { instId } = req.body;
-    if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
+    if (!instId) return res.status(400).json({ ok: false, error: "instId is required", received: req.body });
     const path = `/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`;
     const data = await okxReq("GET", path);
     const arr = Array.isArray(data?.data) ? data.data : [];
@@ -97,10 +156,10 @@ app.post("/order", async (req, res, next) => {
       tpTriggerPx, tpOrdPx,
       slTriggerPx, slOrdPx,
       posSide
-    } = req.body;
+    } = req.body || {};
 
     if (!instId || !side || !sz) {
-      return res.status(400).json({ ok: false, error: "instId, side, sz are required" });
+      return res.status(400).json({ ok: false, error: "instId, side, sz are required", received: req.body });
     }
 
     // Soft-fail leverage
@@ -140,8 +199,8 @@ app.post("/order", async (req, res, next) => {
 // 3) close (cerrar posición abierta del instrumento)
 app.post("/close", async (req, res, next) => {
   try {
-    const { instId, tdMode = "cross", posSide } = req.body;
-    if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
+    const { instId, tdMode = "cross", posSide } = req.body || {};
+    if (!instId) return res.status(400).json({ ok: false, error: "instId is required", received: req.body });
 
     const body = { instId, mgnMode: tdMode, ...(posSide ? { posSide } : {}) };
     const data = await okxReq("POST", "/api/v5/trade/close-position", body);
@@ -152,10 +211,10 @@ app.post("/close", async (req, res, next) => {
 // 4) amend-tpsl (set o modificar TP/SL sobre la posición)
 app.post("/amend-tpsl", async (req, res, next) => {
   try {
-    const { instId, tdMode = "cross", tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body;
-    if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
+    const { instId, tdMode = "cross", tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body || {};
+    if (!instId) return res.status(400).json({ ok: false, error: "instId is required", received: req.body });
     if (!tpTriggerPx && !slTriggerPx) {
-      return res.status(400).json({ ok: false, error: "Provide at least one of tpTriggerPx or slTriggerPx" });
+      return res.status(400).json({ ok: false, error: "Provide at least one of tpTriggerPx or slTriggerPx", received: req.body });
     }
 
     const body = {
@@ -173,9 +232,15 @@ app.post("/amend-tpsl", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Error handler
-app.use((err, _req, res, _next) => {
-  res.status(500).json({ ok: false, error: err?.response?.data || err.message });
+// Error handler con eco del body para depuración
+app.use((err, req, res, _next) => {
+  const payload = {
+    ok: false,
+    error: err?.response?.data || err.message,
+    received: req?.body ?? null
+  };
+  console.error("✖ Handler error:", JSON.stringify(payload).slice(0, 8000));
+  res.status(500).json(payload);
 });
 
 app.listen(PORT, () => console.log(`okx-exec-proxy running on :${PORT}`));
