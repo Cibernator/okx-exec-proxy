@@ -31,7 +31,6 @@ async function okxReq(method, path, bodyObj) {
   if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
     throw new Error("Missing OKX credentials (OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE)");
   }
-
   const ts = await okxTimestampIso();
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
 
@@ -53,15 +52,12 @@ async function okxReq(method, path, bodyObj) {
 // ---------------- Endpoints ----------------
 app.get("/ping", (_req, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
 
+// 1) positions (futuros/swap)
 app.post("/positions", async (req, res, next) => {
   try {
     if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
-      });
+      return res.status(500).json({ ok: false, error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)" });
     }
-
     const { instId } = req.body;
     if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
 
@@ -71,19 +67,53 @@ app.post("/positions", async (req, res, next) => {
     const arr = Array.isArray(data?.data) ? data.data : [];
     const netSz = arr.reduce((sum, p) => sum + Number(p.pos || "0"), 0);
 
-    res.json({
-      ok: true,
-      instId,
-      open: Math.abs(netSz) > 0,
-      netPosSz: netSz,
-      raw: data
-    });
+    res.json({ ok: true, instId, open: Math.abs(netSz) > 0, netPosSz: netSz, raw: data });
   } catch (err) {
     console.error("positions error:", err?.response?.data || err.message);
     next(err);
   }
 });
 
+// 2) order (abrir posición con leverage y TP/SL opcional)
+app.post("/order", async (req, res, next) => {
+  try {
+    const { instId, side, sz, ordType = "market", tdMode = "cross", px,
+            leverage, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body;
+
+    if (!instId || !side || !sz) {
+      return res.status(400).json({ ok: false, error: "instId, side, sz are required" });
+    }
+
+    // (Opcional) set leverage antes de la orden
+    if (leverage) {
+      await okxReq("POST", "/api/v5/account/set-leverage", {
+        instId, lever: String(leverage), mgnMode: tdMode
+      });
+    }
+
+    const body = {
+      instId,
+      side,                     // "buy" | "sell"
+      ordType,                  // "market" | "limit" | "post_only" | ...
+      tdMode,                   // "cross" | "isolated"
+      sz: String(sz),
+      ...(px ? { px: String(px) } : {}),
+      ...(posSide ? { posSide } : {}),
+      ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
+      ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
+      ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
+      ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {})
+    };
+
+    const data = await okxReq("POST", "/api/v5/trade/order", body);
+    res.json({ ok: true, request: body, response: data });
+  } catch (err) {
+    console.error("order error:", err?.response?.data || err.message);
+    next(err);
+  }
+});
+
+// Error handler
 app.use((err, _req, res, _next) => {
   res.status(500).json({ ok: false, error: err?.response?.data || err.message });
 });

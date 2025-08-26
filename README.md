@@ -1,34 +1,43 @@
 # okx-exec-proxy
 
-Proxy mínimo para operar con la API de OKX desde Make, Render o cualquier orquestador.
+Proxy mínimo para operar Futuros/Swap en OKX desde Make/n8n o cualquier cliente HTTP.
+Incluye:
+- `/positions`  → revisa si hay posición abierta (usa `instType=SWAP`)
+- `/order`      → abre posición con leverage y TP/SL opcional
 
 ## Variables de entorno
-- OKX_API_KEY
-- OKX_API_SECRET
-- OKX_API_PASSPHRASE
-- OKX_PAPER (1 = Paper trading, 0 = real)
-- PORT
+- `OKX_API_KEY`
+- `OKX_API_SECRET`
+- `OKX_API_PASSPHRASE`
+- `OKX_PAPER` (1 = Paper trading, 0 = real)
+- `PORT`
 
-## Endpoints
+## Ejemplos
 
-### GET /ping
-Prueba de vida.
+### Ping
+```
+GET /ping
+```
 
-### POST /positions
-Confirma si hay posición abierta (Futuros/Swap).
-
-**Body**
-```json
+### Check posiciones
+```
+POST /positions
 { "instId": "BTC-USDT-SWAP" }
 ```
 
-**Respuesta**
-```json
+### Abrir orden de prueba (market, cross, con TP/SL a mercado)
+```
+POST /order
 {
-  "ok": true,
   "instId": "BTC-USDT-SWAP",
-  "open": false,
-  "netPosSz": 0,
-  "raw": { "...respuesta OKX..." }
+  "side": "buy",
+  "sz": "1",
+  "tdMode": "cross",
+  "ordType": "market",
+  "leverage": "10",
+  "tpTriggerPx": "63000",
+  "tpOrdPx": "-1",
+  "slTriggerPx": "59000",
+  "slOrdPx": "-1"
 }
 ```
