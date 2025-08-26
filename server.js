@@ -6,7 +6,7 @@ const {
   OKX_API_KEY,
   OKX_API_SECRET,
   OKX_API_PASSPHRASE,
-  OKX_PAPER = "0", // "1" = Paper trading
+  OKX_PAPER = "0",
   PORT = 8000
 } = process.env;
 
@@ -14,22 +14,27 @@ const OKX_BASE = "https://www.okx.com";
 const app = express();
 app.use(express.json());
 
-// ------------- Utilidades OKX -------------
+// ---------------- Utils ----------------
 async function okxTimestampIso() {
-  // Hora oficial de OKX → evita desfases de timestamp
   const r = await axios.get(`${OKX_BASE}/api/v5/public/time`);
   const ms = Number(r.data?.data?.[0]?.ts || Date.now());
   return new Date(ms).toISOString();
 }
 
 function okxSign({ timestamp, method, requestPath, body = "" }) {
+  if (!OKX_API_SECRET) throw new Error("Missing OKX_API_SECRET");
   const prehash = `${timestamp}${method}${requestPath}${body}`;
   return crypto.createHmac("sha256", OKX_API_SECRET).update(prehash).digest("base64");
 }
 
 async function okxReq(method, path, bodyObj) {
+  if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
+    throw new Error("Missing OKX credentials (OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE)");
+  }
+
   const ts = await okxTimestampIso();
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
+
   const headers = {
     "OK-ACCESS-KEY": OKX_API_KEY,
     "OK-ACCESS-SIGN": okxSign({ timestamp: ts, method, requestPath: path, body: bodyStr }),
@@ -45,30 +50,26 @@ async function okxReq(method, path, bodyObj) {
   return res.data;
 }
 
-// ------------- Endpoints mínimos -------------
-// Ping
+// ---------------- Endpoints ----------------
 app.get("/ping", (_req, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
 
-// 1) ¿Hay posición abierta? (Futuros/SWAP)
 app.post("/positions", async (req, res, next) => {
   try {
-    const { instId } = req.body; // p.ej. "BTC-USDT-SWAP"
+    if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
+      });
+    }
+
+    const { instId } = req.body;
     if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
 
-    // account/positions devuelve posiciones de Futuros/Swap si instId es SWAP/FUTURES
     const path = `/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`;
     const data = await okxReq("GET", path);
 
-    const pos = (data?.data || [])[0];
-    const posSz = pos ? Number(pos.pos || "0") : 0;
-
-    // En cuentas con modo long/short, pueden venir dos entradas; sumamos neto:
-    let netSz = 0;
-    if (Array.isArray(data?.data) && data.data.length > 0) {
-      netSz = data.data.reduce((sum, p) => sum + Number(p.pos || "0"), 0);
-    } else {
-      netSz = posSz;
-    }
+    const arr = Array.isArray(data?.data) ? data.data : [];
+    const netSz = arr.reduce((sum, p) => sum + Number(p.pos || "0"), 0);
 
     res.json({
       ok: true,
@@ -78,20 +79,13 @@ app.post("/positions", async (req, res, next) => {
       raw: data
     });
   } catch (err) {
-    console.error(err?.response?.data || err.message);
+    console.error("positions error:", err?.response?.data || err.message);
     next(err);
   }
 });
-
-// (quedan listos para cuando avances)
-// /order           → abrir orden (con TP/SL opcional)
-// /amend-tpsl      → modificar TP/SL
-// /cancel-order    → cancelar orden pendiente
-// /close-positions → cerrar posición por mercado
 
 app.use((err, _req, res, _next) => {
   res.status(500).json({ ok: false, error: err?.response?.data || err.message });
 });
 
 app.listen(PORT, () => console.log(`okx-exec-proxy running on :${PORT}`));
-
