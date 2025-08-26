@@ -56,7 +56,7 @@ app.post("/positions", async (req, res, next) => {
     if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
 
     // account/positions devuelve posiciones de Futuros/Swap si instId es SWAP/FUTURES
-    const path = `/api/v5/account/positions?instId=${encodeURIComponent(instId)}`;
+    const path = `/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`;
     const data = await okxReq("GET", path);
 
     const pos = (data?.data || [])[0];
@@ -94,3 +94,4 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => console.log(`okx-exec-proxy running on :${PORT}`));
+
