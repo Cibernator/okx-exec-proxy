@@ -1,0 +1,28 @@
+# ==========================
+# Archivos a ignorar en Git
+# ==========================
+
+# Dependencias de Node.js
+node_modules/
+
+# Variables de entorno (NO subir claves privadas)
+.env
+
+# Logs y archivos temporales
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Carpeta de compilación (por si luego compilas algo)
+dist/
+
+# Archivos temporales de editor
+*.swp
+*.swo
+.idea/
+.vscode/
