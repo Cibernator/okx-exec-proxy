@@ -154,3 +154,21 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => console.log(`okx-exec-proxy running on :${PORT}`));
+
+// === Diagnóstico de cuenta ===
+// 1) Configuración de cuenta (posMode, etc.)
+app.get("/account/config", async (_req, res, next) => {
+  try {
+    const data = await okxReq("GET", "/api/v5/account/config");
+    res.json({ ok: true, data });
+  } catch (err) { next(err); }
+});
+
+// 2) Balance (USDT en cuenta de contratos)
+app.get("/account/balance", async (_req, res, next) => {
+  try {
+    const data = await okxReq("GET", "/api/v5/account/balance?ccy=USDT");
+    res.json({ ok: true, data });
+  } catch (err) { next(err); }
+});
+
