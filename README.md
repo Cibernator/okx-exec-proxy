@@ -1,48 +1,73 @@
-# okx-exec-proxy (v3)
 
-Proxy para operar Futuros/Swap en OKX desde Make/Render.
-Incluye:
-- `POST /positions`  → revisa si hay posición abierta (usa `instType=SWAP`)
-- `POST /order`      → abre posición (market/limit) con leverage y TP/SL opcional
-- `POST /close`      → cierra posición abierta del instrumento (usa `trade/close-position`)
-- `POST /amend-tpsl` → coloca/modifica TP/SL sobre la posición (usa `trade/tpsl`)
-- `GET  /account/config` → ver `posMode` (net/long_short), etc.
-- `GET  /account/balance?ccy=USDT` → ver balance de contratos
+# okx-exec-proxy v3
+
+Proxy ligero para ejecutar órdenes en **OKX** desde Make / Postman.
+Implementa firma v5, soporta paper trading y adjunta TP/SL en la creación de órdenes.
+
+## Endpoints
+
+- `GET /ping`
+- `GET /debug/env`
+- `POST /positions`
+- `POST /order` (abre y permite TP/SL + seteo de leverage opcional antes de la orden)
+- `POST /close` (cierre market reduceOnly; si no envías `sz` o pones `all:true`, cierra todo)
+- `GET /balance` (`?ccy=USDT` por defecto)
+- `POST /amend-tpsl` (best-effort: cancela “advance algos” existentes y crea nuevos TP/SL)
+
+## Variables de entorno
+
+```env
+OKX_API_KEY=
+OKX_SECRET_KEY=
+OKX_PASSPHRASE=
+PAPER=1  # 1=demo, 0 o vacío=real
+PORT=10000
+```
+
+## Deploy en Render
+- Crear servicio **Web Service** -> conectar el repo o subir este ZIP.
+- `Start command`: `node server.js`
+- Añadir las variables de entorno.
+- Si usas paper: `x-simulated-trading: 1` se envía automáticamente.
 
 ## Ejemplos
 
-### Abrir orden (NET mode, sin `posSide`)
+**/positions**
+```json
+{ "instId": "BTC-USDT-SWAP" }
 ```
-POST /order
+
+**/order**
+```json
 {
   "instId": "BTC-USDT-SWAP",
   "side": "buy",
-  "sz": "186",
-  "tdMode": "cross",
   "ordType": "market",
-  "leverage": "3",
-  "tpTriggerPx": "110440",
+  "tdMode": "cross",
+  "sz": "1",
+  "lever": "3",
+  "tpTriggerPx": "111540",
   "tpOrdPx": "-1",
   "slTriggerPx": "109780",
   "slOrdPx": "-1"
 }
 ```
 
-### Cerrar posición (NET mode)
-```
-POST /close
-{ "instId": "BTC-USDT-SWAP", "tdMode": "cross" }
+**/close**
+```json
+{ "instId": "BTC-USDT-SWAP", "all": true }
 ```
 
-### Colocar/Modificar TP/SL
-```
-POST /amend-tpsl
+**/balance**
+`GET /balance?ccy=USDT`
+
+**/amend-tpsl**
+```json
 {
   "instId": "BTC-USDT-SWAP",
-  "tdMode": "cross",
-  "tpTriggerPx": "110440",
+  "tpTriggerPx": "112000",
   "tpOrdPx": "-1",
-  "slTriggerPx": "109780",
+  "slTriggerPx": "109000",
   "slOrdPx": "-1"
 }
 ```
