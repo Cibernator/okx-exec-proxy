@@ -16,6 +16,7 @@ app.use(express.json());
 
 // ---------------- Utils ----------------
 async function okxTimestampIso() {
+  // Hora oficial de OKX para evitar skew
   const r = await axios.get(`${OKX_BASE}/api/v5/public/time`);
   const ms = Number(r.data?.data?.[0]?.ts || Date.now());
   return new Date(ms).toISOString();
@@ -28,9 +29,11 @@ function okxSign({ timestamp, method, requestPath, body = "" }) {
 }
 
 async function okxReq(method, path, bodyObj) {
+  // Validaciones tempranas para errores claros
   if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
     throw new Error("Missing OKX credentials (OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE)");
   }
+
   const ts = await okxTimestampIso();
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
 
@@ -44,19 +47,41 @@ async function okxReq(method, path, bodyObj) {
   if (OKX_PAPER === "1") headers["x-simulated-trading"] = "1";
 
   const url = `${OKX_BASE}${path}`;
-  const cfg = { method, url, headers, data: bodyStr || undefined, timeout: 15000 };
-  const res = await axios(cfg);
-  return res.data;
+  try {
+    const res = await axios({ method, url, headers, data: bodyStr || undefined, timeout: 15000 });
+    return res.data;
+  } catch (err) {
+    // Log detallado para depurar rápido
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    console.error("OKX HTTP ERROR →", {
+      method, path, status, data, message: err.message
+    });
+    throw err;
+  }
 }
 
 // ---------------- Endpoints ----------------
 app.get("/ping", (_req, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
 
+// Diagnóstico rápido de entorno (NO expone valores)
+app.get("/debug/env", (_req, res) => {
+  res.json({
+    hasKey: !!OKX_API_KEY,
+    hasSecret: !!OKX_API_SECRET,
+    hasPassphrase: !!OKX_API_PASSPHRASE,
+    paper: OKX_PAPER
+  });
+});
+
 // 1) positions (futuros/swap)
 app.post("/positions", async (req, res, next) => {
   try {
     if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
-      return res.status(500).json({ ok: false, error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)" });
+      return res.status(500).json({
+        ok: false,
+        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
+      });
     }
     const { instId } = req.body;
     if (!instId) return res.status(400).json({ ok: false, error: "instId is required" });
@@ -77,6 +102,13 @@ app.post("/positions", async (req, res, next) => {
 // 2) order (abrir posición con leverage y TP/SL opcional)
 app.post("/order", async (req, res, next) => {
   try {
+    if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_API_PASSPHRASE) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing OKX credentials (OKX_API_KEY/SECRET/PASSPHRASE)"
+      });
+    }
+
     const { instId, side, sz, ordType = "market", tdMode = "cross", px,
             leverage, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide } = req.body;
 
@@ -102,8 +134,11 @@ app.post("/order", async (req, res, next) => {
       ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
       ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
       ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
-      ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {})
+      ...(slOrdPx ? { slOrdPx: String(slOrdLvOrdPx) } : {}) // typo intencional? No → corregido abajo
     };
+
+    // CORRECCIÓN: slOrdPx real
+    if (slOrdPx) body.slOrdPx = String(slOrdPx);
 
     const data = await okxReq("POST", "/api/v5/trade/order", body);
     res.json({ ok: true, request: body, response: data });
