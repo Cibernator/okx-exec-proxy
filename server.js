@@ -185,61 +185,78 @@ app.get("/balance", async (req, res) => {
 });
 
 // --- AMEND TP/SL: cancela los existentes y crea nuevos ---
-app.post("/amend-tpsl", async (req, res) => {
+app.post('/amend-tpsl', async (req, res) => {
   try {
-    const { instId, cancelExisting, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx } = req.body || {};
-    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
+    const {
+      instId,
+      cancelExisting,          // true/false
+      tpTriggerPx, tpOrdPx,    // "-1" para market
+      slTriggerPx, slOrdPx
+    } = req.body || {};
 
-    // 1) Leer posición para deducir side/tdMode/sz
-    const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-    const rows = pos.data?.data || [];
-    const { open, netPosSz, sample } = parseNetPos(rows);
-    if (!open) return res.status(400).json({ ok: false, error: "No open position" });
+    if (!instId) return res.status(400).json({ ok:false, error:'instId requerido' });
 
-    const tdMode = sample?.mgnMode || "cross";
-    const sz = String(Math.abs(netPosSz));
-    const side = netPosSz > 0 ? "sell" : "buy"; // cerrar la posición
+    // 0) Determinar tamaño y sentido actual para que el TP/SL sea reduceOnly del lado correcto.
+    const posResp = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+    const rows = posResp.data?.data || [];
+    let net = 0;
+    for (const p of rows) net += Number(p.pos || 0);
+    if (net === 0) {
+      return res.json({ ok:true, msg:'Sin posición abierta; no hay TP/SL que crear' });
+    }
+    const sz = String(Math.abs(net));
+    const side = net > 0 ? 'sell' : 'buy'; // para cerrar la posición neta
+    const tdMode = 'cross';                // mismo modo que usas al abrir
 
-    // 2) Cancelar algos existentes (opcional)
+    // 1) Cancelar algos existentes si lo piden
     if (cancelExisting) {
-      // listar algos pendientes
-      const pend = await okxPost("/api/v5/trade/orders-algo-pending", { instType: "SWAP", instId });
-      const ids = (pend.data?.data || [])
+      // listar algos pendientes tipo "conditional" del instId
+      const listPath =
+        `/api/v5/trade/orders-algo-pending?instType=SWAP&instId=${encodeURIComponent(instId)}&ordType=conditional`;
+      const listRes = await okxGet(listPath);
+      const ids = (listRes.data?.data || [])
         .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
         .map(a => a.algoId);
 
       if (ids.length) {
-        const cancelBody = ids.map(algoId => ({ instId, algoId }));
-        await okxPost("/api/v5/trade/cancel-algos", cancelBody);
+        const cancelPayload = ids.map(id => ({ algoId: id, instId }));
+        await okxPost('/api/v5/trade/cancel-algos', cancelPayload);
       }
     }
 
-    // 3) Construir nuevo TP/SL
+    // 2) Construir nuevo TP/SL (solo los campos enviados)
     const algo = {
       instId,
+      ordType: 'conditional',
       tdMode,
-      side,
-      ordType: "conditional",
-      reduceOnly: "true",
-      sz
+      side,        // importante para que sea reduceOnly del lado correcto
+      sz,          // tamaño a cerrar
+      reduceOnly: 'true'
     };
-    if (tpTriggerPx) algo.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx)     algo.tpOrdPx     = String(tpOrdPx);
-    if (slTriggerPx) algo.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx)     algo.slOrdPx     = String(slOrdPx);
+    if (tpTriggerPx != null) algo.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx     != null) algo.tpOrdPx     = String(tpOrdPx);
+    if (slTriggerPx != null) algo.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx     != null) algo.slOrdPx     = String(slOrdPx);
 
+    // Si no enviaron ningún TP/SL nuevo, no crear nada
     if (!algo.tpTriggerPx && !algo.slTriggerPx) {
-      return res.json({ ok: true, msg: "Sin cambios (no se enviaron nuevos TP/SL)" });
+      return res.json({ ok:true, msg:'Sin cambios (no se enviaron nuevos TP/SL)' });
     }
 
-    // order-algo acepta array (batch)
-    const place = await okxPost("/api/v5/trade/order-algo", [algo]);
+    // OKX exige array de algos
+    const place = await okxPost('/api/v5/trade/order-algo', [algo]);
 
-    res.json({ ok: true, request: { instId, cancelExisting, algo }, response: place.data });
+    return res.json({
+      ok: true,
+      request: { instId, cancelExisting, algo },
+      response: place.data
+    });
   } catch (err) {
-    res.status(err?.response?.status || 500).json({
+    console.error('amend-tpsl error:', err?.response?.data || err?.message || err);
+    return res.status(err?.response?.status || 500).json({
       ok: false,
-      error: err?.response?.data || err?.message || "amend-tpsl failed"
+      error: err?.message || 'amend-tpsl failed',
+      detail: err?.response?.data
     });
   }
 });
