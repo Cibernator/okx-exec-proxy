@@ -189,66 +189,61 @@ app.post('/amend-tpsl', async (req, res) => {
   try {
     const {
       instId,
-      cancelExisting,          // true/false
-      tpTriggerPx, tpOrdPx,    // "-1" para market
+      tdMode = 'cross',        // <- requerido por OKX
+      posSide,                 // opcional (net/long/short) si usas hedge
+      cancelExisting = false,  // true = cancelar TP/SL activos antes de crear
+      tpTriggerPx, tpOrdPx,
       slTriggerPx, slOrdPx
     } = req.body || {};
 
-    if (!instId) return res.status(400).json({ ok:false, error:'instId requerido' });
-
-    // 0) Determinar tamaño y sentido actual para que el TP/SL sea reduceOnly del lado correcto.
-    const posResp = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-    const rows = posResp.data?.data || [];
-    let net = 0;
-    for (const p of rows) net += Number(p.pos || 0);
-    if (net === 0) {
-      return res.json({ ok:true, msg:'Sin posición abierta; no hay TP/SL que crear' });
+    if (!instId) {
+      return res.status(400).json({ ok:false, error:'instId requerido' });
     }
-    const sz = String(Math.abs(net));
-    const side = net > 0 ? 'sell' : 'buy'; // para cerrar la posición neta
-    const tdMode = 'cross';                // mismo modo que usas al abrir
 
-    // 1) Cancelar algos existentes si lo piden
+    // 1) Cancelar TP/SL existentes (si se pide)
+    let cancelled = [];
     if (cancelExisting) {
-      // listar algos pendientes tipo "conditional" del instId
-      const listPath =
-        `/api/v5/trade/orders-algo-pending?instType=SWAP&instId=${encodeURIComponent(instId)}&ordType=conditional`;
-      const listRes = await okxGet(listPath);
-      const ids = (listRes.data?.data || [])
+      const listPath = `/api/v5/trade/orders-algo-pending?instId=${encodeURIComponent(instId)}&ordType=conditional`;
+      const pending = await okxGet(listPath);      // <- GET
+      const rows = pending.data?.data || [];
+
+      const ids = rows
         .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
         .map(a => a.algoId);
 
       if (ids.length) {
+        // OKX exige un array de objetos {algoId, instId}
         const cancelPayload = ids.map(id => ({ algoId: id, instId }));
-        await okxPost('/api/v5/trade/cancel-algos', cancelPayload);
+        const rCancel = await okxPost('/api/v5/trade/cancel-algos', cancelPayload);
+        cancelled = rCancel.data?.data || [];
       }
     }
 
-    // 2) Construir nuevo TP/SL (solo los campos enviados)
+    // 2) Construir nuevo TP/SL sólo con lo que envíes
     const algo = {
       instId,
       ordType: 'conditional',
-      tdMode,
-      side,        // importante para que sea reduceOnly del lado correcto
-      sz,          // tamaño a cerrar
-      reduceOnly: 'true'
+      tdMode,                  // requerido
+      reduceOnly: 'true'       // para que NO abra posición nueva
     };
+    if (posSide) algo.posSide = posSide;  // si usas hedge
     if (tpTriggerPx != null) algo.tpTriggerPx = String(tpTriggerPx);
     if (tpOrdPx     != null) algo.tpOrdPx     = String(tpOrdPx);
     if (slTriggerPx != null) algo.slTriggerPx = String(slTriggerPx);
     if (slOrdPx     != null) algo.slOrdPx     = String(slOrdPx);
 
-    // Si no enviaron ningún TP/SL nuevo, no crear nada
+    // Si no llega ningún nuevo TP/SL, terminamos aquí
     if (!algo.tpTriggerPx && !algo.slTriggerPx) {
-      return res.json({ ok:true, msg:'Sin cambios (no se enviaron nuevos TP/SL)' });
+      return res.json({ ok:true, msg:'Sin cambios (no se enviaron nuevos TP/SL)', cancelled });
     }
 
-    // OKX exige array de algos
+    // IMPORTANTE: OKX requiere ARRAY de objetos
     const place = await okxPost('/api/v5/trade/order-algo', [algo]);
 
     return res.json({
       ok: true,
-      request: { instId, cancelExisting, algo },
+      cancelled,
+      request: algo,
       response: place.data
     });
   } catch (err) {
@@ -256,7 +251,7 @@ app.post('/amend-tpsl', async (req, res) => {
     return res.status(err?.response?.status || 500).json({
       ok: false,
       error: err?.message || 'amend-tpsl failed',
-      detail: err?.response?.data
+      detail: err?.response?.data || null
     });
   }
 });
