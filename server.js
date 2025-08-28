@@ -1,5 +1,5 @@
-// okx-exec-proxy v3 — server.js (compat vars + baseURL de .env)
-// Fuente original del usuario adaptada para Render y OKX (v5)
+// okx-exec-proxy v3 — server.js
+// Ligero proxy para OKX (v5). Listo para Render/Node 18+.
 
 import express from "express";
 import crypto from "crypto";
@@ -10,7 +10,7 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
-// === Variables de entorno (compatibilidad con distintos nombres) ===
+// === ENV (acepta varios nombres por compatibilidad) ===
 const API_KEY =
   process.env.OKX_API_KEY ||
   process.env.OKX_APIKEY ||
@@ -19,77 +19,69 @@ const API_KEY =
 
 const SECRET_KEY =
   process.env.OKX_SECRET_KEY ||
-  process.env.OKX_API_SECRET ||   // <- Render screenshot
+  process.env.OKX_API_SECRET ||
   process.env.OKX_SECRET ||
   "";
 
 const PASSPHRASE =
   process.env.OKX_PASSPHRASE ||
-  process.env.OKX_API_PASSPHRASE || // <- Render screenshot
+  process.env.OKX_API_PASSPHRASE ||
   "";
 
 const PAPER = process.env.PAPER === "1" ? "1" : "0";
+const BASE_URL = (process.env.OKX_API_BASEURL || "https://www.okx.com").trim();
 
-const BASE_URL =
-  process.env.OKX_API_BASEURL?.trim() || "https://www.okx.com";
+// --- Cliente HTTP OKX ---
+const okx = axios.create({ baseURL: BASE_URL, timeout: 15000 });
 
-// Cliente OKX
-const okx = axios.create({
-  baseURL: BASE_URL,
-  timeout: 15000,
-});
-
-// Utils
+// --- Utils firma OKX ---
 const isoNow = () => new Date().toISOString();
 
 function sign({ ts, method, path, body = "" }) {
   const prehash = `${ts}${method}${path}${body}`;
-  const hmac = crypto.createHmac("sha256", SECRET_KEY);
-  hmac.update(prehash);
-  return hmac.digest("base64");
+  return crypto.createHmac("sha256", SECRET_KEY).update(prehash).digest("base64");
 }
 
-function headers({ ts, method, path, body }) {
+function buildHeaders({ ts, method, path, body }) {
   return {
     "OK-ACCESS-KEY": API_KEY,
     "OK-ACCESS-SIGN": sign({ ts, method, path, body }),
     "OK-ACCESS-TIMESTAMP": ts,
     "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-    "x-simulated-trading": PAPER, // "1" = paper, "0" = real
+    "x-simulated-trading": PAPER, // "1" paper, "0" real
     "Content-Type": "application/json",
   };
 }
 
 async function okxGet(path) {
   const ts = isoNow();
-  return okx.get(path, { headers: headers({ ts, method: "GET", path, body: "" }) });
+  return okx.get(path, { headers: buildHeaders({ ts, method: "GET", path, body: "" }) });
 }
 
 async function okxPost(path, payload = {}) {
   const ts = isoNow();
   const body = JSON.stringify(payload);
-  return okx.post(path, payload, { headers: headers({ ts, method: "POST", path, body }) });
+  return okx.post(path, payload, { headers: buildHeaders({ ts, method: "POST", path, body }) });
 }
 
-// Helpers
-function parseNetPos(data = []) {
+// --- Helpers ---
+function parseNetPos(rows = []) {
   let net = 0;
-  let first = null;
-  for (const p of data) {
-    if (p.pos && p.instId) {
-      if (!first) first = p;
+  let sample = null;
+  for (const p of rows) {
+    if (p && p.instId) {
+      if (!sample) sample = p;
       net += Number(p.pos || 0);
     }
   }
-  return { open: net !== 0, netPosSz: net, sample: first || null };
+  return { open: net !== 0, netPosSz: net, sample };
 }
 
-// -------- Endpoints --------
-app.get("/ping", (_, res) => {
-  res.json({ ok: true, service: "okx-exec-proxy" });
-});
+// --- Endpoints ---
 
-app.get("/debug/env", (_, res) => {
+app.get("/ping", (_, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
+
+app.get("/debug/env", (_, res) =>
   res.json({
     ok: true,
     baseURL: BASE_URL,
@@ -97,8 +89,8 @@ app.get("/debug/env", (_, res) => {
     hasSecret: Boolean(SECRET_KEY),
     hasPassphrase: Boolean(PASSPHRASE),
     paper: PAPER,
-  });
-});
+  })
+);
 
 // POST /positions  { instId, instType="SWAP" }
 app.post("/positions", async (req, res) => {
@@ -129,7 +121,7 @@ app.post("/order", async (req, res) => {
     if (!instId || !side || !ordType || !tdMode)
       return res.status(400).json({ ok: false, error: "instId, side, ordType, tdMode required" });
 
-    // 1) leverage (opcional)
+    // (1) set leverage (opcional, best-effort)
     let leverageNote = null;
     if (lever) {
       const levPayload = { instId, lever: String(lever), mgnMode: tdMode };
@@ -141,13 +133,13 @@ app.post("/order", async (req, res) => {
       }
     }
 
-    // 2) orden
+    // (2) place order
     const ord = { instId, side, ordType, tdMode, sz: String(sz ?? "1") };
     if (posSide) ord.posSide = posSide;
     if (tpTriggerPx) ord.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx) ord.tpOrdPx = String(tpOrdPx);
+    if (tpOrdPx)     ord.tpOrdPx     = String(tpOrdPx);
     if (slTriggerPx) ord.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx) ord.slOrdPx = String(slOrdPx);
+    if (slOrdPx)     ord.slOrdPx     = String(slOrdPx);
 
     const r = await okxPost("/api/v5/trade/order", ord);
     res.json({ ok: true, request: ord, response: r.data, leverageNote });
@@ -167,10 +159,10 @@ app.post("/close", async (req, res) => {
     let side = req.body?.side;
     let size = sz;
 
+    // Si no especifica lado/tamaño o pide all, inferimos desde la posición neta:
     if (!side || !size || all) {
       const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-      const rows = pos.data?.data || [];
-      const net = parseNetPos(rows);
+      const net = parseNetPos(pos.data?.data || []);
       if (!net.open) return res.json({ ok: true, msg: "No open position" });
       size = String(Math.abs(net.netPosSz));
       side = net.netPosSz > 0 ? "sell" : "buy"; // opuesto para cerrar
@@ -202,64 +194,64 @@ app.get("/balance", async (req, res) => {
   }
 });
 
-// --- AMEND TP/SL: cancela los existentes y crea nuevos ---
-app.post('/amend-tpsl', async (req, res) => {
+// POST /amend-tpsl
+// Body: { instId, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx?, cancelExisting?: true }
+app.post("/amend-tpsl", async (req, res) => {
   try {
     const { instId, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, cancelExisting } = req.body || {};
-    if (!instId) return res.status(400).json({ ok:false, error:'instId requerido' });
+    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
 
-    // 1) Si piden cancelar los existentes, listarlos y cancelarlos
+    // 1) Cancelar TP/SL existentes (advance algo) si se pide:
     if (cancelExisting) {
-      // Trae algos pendientes (TP/SL se listan aquí con ordType=conditional)
-      const list = await okxGET('/api/v5/trade/orders-algo-pending', { instId, ordType: 'conditional' });
-      const ids = (list.data || [])
+      const listPath = `/api/v5/trade/orders-algo-pending?instId=${encodeURIComponent(instId)}&ordType=conditional`;
+      const list = await okxGet(listPath);
+      const ids = (list.data?.data || [])
         .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
         .map(a => a.algoId);
 
       if (ids.length) {
-        const payload = ids.map(id => ({ algoId: id, instId }));
-        await okxPOST('/api/v5/trade/cancel-algos', payload);
+        const payload = ids.map(algoId => ({ algoId, instId }));
+        await okxPost("/api/v5/trade/cancel-algos", payload);
       }
     }
 
-    // 2) Construir nuevo TP/SL (solo los campos que envíen)
-    const algoPayload = {
+    // 2) Crear nuevos TP/SL (solo si llega alguno):
+    const algo = {
       instId,
-      ordType: 'conditional',
-      // reduceOnly para que no abra nuevas posiciones
-      reduceOnly: 'true'
+      ordType: "conditional",
+      reduceOnly: "true",
     };
-    if (tpTriggerPx) algoPayload.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx)     algoPayload.tpOrdPx     = String(tpOrdPx);
-    if (slTriggerPx) algoPayload.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx)     algoPayload.slOrdPx     = String(slOrdPx);
+    if (tpTriggerPx) algo.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx)     algo.tpOrdPx     = String(tpOrdPx);
+    if (slTriggerPx) algo.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx)     algo.slOrdPx     = String(slOrdPx);
 
-    // Si no se manda nada nuevo, responder sin crear
-    if (!algoPayload.tpTriggerPx && !algoPayload.slTriggerPx) {
-      return res.json({ ok:true, msg:'Sin cambios (no se enviaron nuevos TP/SL)' });
+    if (!algo.tpTriggerPx && !algo.slTriggerPx) {
+      return res.json({ ok: true, msg: "Sin cambios (no se enviaron nuevos TP/SL)" });
     }
 
-    const place = await okxPOST('/api/v5/trade/order-algo', [algoPayload]);
+    // Nota: este endpoint acepta array de algos
+    const place = await okxPost("/api/v5/trade/order-algo", [algo]);
 
-    return res.json({
+    res.json({
       ok: true,
       request: { instId, cancelExisting, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx },
-      response: place
+      response: place.data,
     });
   } catch (err) {
-    console.error('amend-tpsl error:', err?.response?.data || err?.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: err?.response?.data || err?.message || 'amend-tpsl failed'
-    });
+    console.error("amend-tpsl error:", err?.response?.data || err?.message || err);
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data || "amend-tpsl failed" });
   }
 });
 
-
-// Arranque
+// --- Start ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`okx-exec-proxy running on :${PORT}`);
-  console.log(`env: baseURL=${BASE_URL} paper=${PAPER} key=${API_KEY ? "✓" : "×"} pass=${PASSPHRASE ? "✓" : "×"}`);
-  console.log(`Your service is live`);
+  console.log(
+    `env: baseURL=${BASE_URL} paper=${PAPER} key=${API_KEY ? "✓" : "×"} pass=${PASSPHRASE ? "✓" : "×"}`
+  );
+  console.log("Your service is live");
 });
