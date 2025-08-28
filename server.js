@@ -202,51 +202,59 @@ app.get("/balance", async (req, res) => {
   }
 });
 
-// POST /amend-tpsl  { instId, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx? }
-app.post("/amend-tpsl", async (req, res) => {
-  const { instId, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx } = req.body || {};
-  if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
-
+// --- AMEND TP/SL: cancela los existentes y crea nuevos ---
+app.post('/amend-tpsl', async (req, res) => {
   try {
-    // 1) cancelar algos pendientes (TP/SL) para este instrumento
-    let cancelNote = null;
-    try {
-      const pend = await okxGet(`/api/v5/trade/orders-algo-pending?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-      const toCancel = (pend.data?.data || [])
-        .filter(x => ["take_profit", "stop_loss", "conditional", "trigger"].includes(String(x.algoType || "").toLowerCase()))
-        .map(x => ({ algoId: x.algoId, instId }));
-      if (toCancel.length) {
-        cancelNote = await okxPost("/api/v5/trade/cancel-advance-algo-orders", toCancel);
-      }
-    } catch (e) {
-      cancelNote = { warn: "cancel advance algos failed", reason: e?.response?.data || e.message };
-    }
+    const { instId, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, cancelExisting } = req.body || {};
+    if (!instId) return res.status(400).json({ ok:false, error:'instId requerido' });
 
-    // 2) crear nuevos TP/SL (conditional)
-    let placeNote = null;
-    if (tpTriggerPx || slTriggerPx) {
-      const payload = {
-        instId,
-        tdMode: "cross",
-        ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
-        ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
-        ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
-        ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {}),
-      };
-      try {
-        placeNote = await okxPost("/api/v5/trade/order-algo", [{ ...payload, ordType: "conditional" }]);
-      } catch (e) {
-        placeNote = { warn: "order-algo failed", reason: e?.response?.data || e.message, tried: payload };
+    // 1) Si piden cancelar los existentes, listarlos y cancelarlos
+    if (cancelExisting) {
+      // Trae algos pendientes (TP/SL se listan aquí con ordType=conditional)
+      const list = await okxGET('/api/v5/trade/orders-algo-pending', { instId, ordType: 'conditional' });
+      const ids = (list.data || [])
+        .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
+        .map(a => a.algoId);
+
+      if (ids.length) {
+        const payload = ids.map(id => ({ algoId: id, instId }));
+        await okxPOST('/api/v5/trade/cancel-algos', payload);
       }
     }
 
-    res.json({ ok: true, instId, cancelNote, placeNote });
+    // 2) Construir nuevo TP/SL (solo los campos que envíen)
+    const algoPayload = {
+      instId,
+      ordType: 'conditional',
+      // reduceOnly para que no abra nuevas posiciones
+      reduceOnly: 'true'
+    };
+    if (tpTriggerPx) algoPayload.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx)     algoPayload.tpOrdPx     = String(tpOrdPx);
+    if (slTriggerPx) algoPayload.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx)     algoPayload.slOrdPx     = String(slOrdPx);
+
+    // Si no se manda nada nuevo, responder sin crear
+    if (!algoPayload.tpTriggerPx && !algoPayload.slTriggerPx) {
+      return res.json({ ok:true, msg:'Sin cambios (no se enviaron nuevos TP/SL)' });
+    }
+
+    const place = await okxPOST('/api/v5/trade/order-algo', [algoPayload]);
+
+    return res.json({
+      ok: true,
+      request: { instId, cancelExisting, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx },
+      response: place
+    });
   } catch (err) {
-    res
-      .status(err?.response?.status || 500)
-      .json({ ok: false, error: err.message, detail: err?.response?.data });
+    console.error('amend-tpsl error:', err?.response?.data || err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.response?.data || err?.message || 'amend-tpsl failed'
+    });
   }
 });
+
 
 // Arranque
 const PORT = process.env.PORT || 10000;
