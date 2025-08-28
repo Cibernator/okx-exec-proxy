@@ -172,78 +172,76 @@ app.get("/balance", async (req, res) => {
   }
 });
 
-// POST /amend-tpsl
-// Body: { instId, tdMode="cross", cancelExisting=true|false, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx?, sz?, side?, posSide? }
+// --- AMEND TP/SL: cancela existentes y crea nuevos TP/SL como "conditional" ---
 app.post("/amend-tpsl", async (req, res) => {
   try {
     const {
       instId,
       tdMode = "cross",
-      cancelExisting = false,
+      posSide,                 // opcional
+      cancelExisting = true,
+      triggerPxType = "last",  // "last" | "mark" | "index"
       tpTriggerPx, tpOrdPx,
-      slTriggerPx, slOrdPx,
-      sz, side, posSide
+      slTriggerPx, slOrdPx
     } = req.body || {};
-    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
 
-    // 0) Si no viene ni TP ni SL nuevo, no hacemos nada
-    if (!tpTriggerPx && !slTriggerPx)
-      return res.status(400).json({ ok: false, error: "tpTriggerPx o slTriggerPx requerido" });
+    if (!instId) {
+      return res.status(400).json({ ok: false, error: "instId requerido" });
+    }
 
-    // 1) Si piden cancelar TP/SL existentes (algos "conditional")
-    let cancelled = [];
+    // 1) Cancelar algos existentes (TP/SL previos)
     if (cancelExisting) {
-      const list = await okxGet(`/api/v5/trade/orders-algo-pending?instId=${encodeURIComponent(instId)}&ordType=conditional`);
-      const ids = (list.data?.data || [])
+      // Listado de algos pendientes tipo "conditional"
+      const listPath = `/api/v5/trade/orders-algo-pending?instId=${encodeURIComponent(instId)}&ordType=conditional`;
+      const listRes  = await okxGet(listPath);
+      const pending  = listRes.data?.data || [];
+
+      const algosToCancel = pending
         .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
-        .map(a => a.algoId);
-      if (ids.length) {
-        const payload = ids.map(id => ({ algoId: id, instId }));
-        const c = await okxPost("/api/v5/trade/cancel-algos", payload);
-        cancelled = c.data;
+        .map(a => ({ algoId: a.algoId, instId: a.instId }));
+
+      if (algosToCancel.length) {
+        // PARA TP/SL se cancela con "cancel-advance-algos" en array
+        await okxPost("/api/v5/trade/cancel-advance-algos", algosToCancel);
       }
     }
 
-    // 2) Determinar side/sz si no vienen: usar la posición neta actual
-    let useSide = side;
-    let useSz = sz;
-    if (!useSide || !useSz) {
-      const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-      const net = parseNetPos(pos.data?.data || []);
-      if (!net.open) return res.status(400).json({ ok: false, error: "No hay posición abierta para calcular side/sz" });
-      useSide = useSide || oppositeSide(net.netPosSz);   // cerrar la posición cuando se dispare
-      useSz   = useSz   || String(Math.abs(net.netPosSz));
-    }
-
-    // 3) Crear el NUEVO TP/SL como "conditional" (array de 1)
+    // 2) Construir nuevo TP/SL. OKX espera un ARRAY de objetos.
     const algo = {
       instId,
-      tdMode,
+      tdMode,                // requerido por OKX en muchos modos
       ordType: "conditional",
-      side: useSide,
-      sz: String(useSz),
       reduceOnly: "true",
+      // tipos de disparo
+      tpTriggerPxType: triggerPxType,
+      slTriggerPxType: triggerPxType,
     };
-    if (posSide)     algo.posSide     = posSide;
-    if (tpTriggerPx) algo.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx)     algo.tpOrdPx     = String(tpOrdPx);
-    if (slTriggerPx) algo.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx)     algo.slOrdPx     = String(slOrdPx);
+    if (posSide) algo.posSide = posSide;
+    if (tpTriggerPx != null) algo.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx     != null) algo.tpOrdPx     = String(tpOrdPx);
+    if (slTriggerPx != null) algo.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx     != null) algo.slOrdPx     = String(slOrdPx);
 
-    const placed = await okxPost("/api/v5/trade/order-algo", [algo]);
+    // Si no llegó ningún nuevo TP/SL, no creamos nada
+    const willPlaceTP = !!algo.tpTriggerPx;
+    const willPlaceSL = !!algo.slTriggerPx;
+    if (!willPlaceTP && !willPlaceSL) {
+      return res.json({ ok: true, msg: "Sin cambios (no se enviaron nuevos TP/SL)" });
+    }
 
-    res.json({
+    // IMPORTANTE: enviar ARRAY
+    const placeRes = await okxPost("/api/v5/trade/order-algo", [algo]);
+
+    return res.json({
       ok: true,
-      cancelled,
-      placed: placed.data,
-      request: { instId, tdMode, side: useSide, sz: useSz, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide }
+      request: { cancelExisting, triggerPxType, tdMode, posSide, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx },
+      response: placeRes.data
     });
   } catch (err) {
-    res.status(err?.response?.status || 500).json({
-      ok: false,
-      error: err?.message || "amend-tpsl failed",
-      detail: err?.response?.data
-    });
+    const status = err?.response?.status || 500;
+    const detail = err?.response?.data || err.message || err;
+    console.error("amend-tpsl error:", detail);
+    return res.status(status).json({ ok: false, error: "amend-tpsl failed", detail });
   }
 });
 
