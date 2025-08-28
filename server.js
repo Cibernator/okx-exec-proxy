@@ -1,4 +1,6 @@
-// okx-exec-proxy v3 — server.js (Render + OKX v5) — FULL
+// okx-exec-proxy v3 — server.js (Render + OKX v5)
+// Mantiene /ping, /debug/env, /positions, /order, /close, /balance, /amend-tpsl
+
 import express from "express";
 import crypto from "crypto";
 import axios from "axios";
@@ -8,23 +10,27 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
-// === ENV (nombres compatibles) ===
+// === Variables de entorno (compat) ===
 const API_KEY =
-  process.env.OKX_API_KEY || process.env.OKX_APIKEY || process.env.OKX_KEY || "";
+  process.env.OKX_API_KEY ||
+  process.env.OKX_APIKEY ||
+  process.env.OKX_KEY || "";
 
 const SECRET_KEY =
-  process.env.OKX_SECRET_KEY || process.env.OKX_API_SECRET || process.env.OKX_SECRET || "";
+  process.env.OKX_SECRET_KEY ||
+  process.env.OKX_API_SECRET ||
+  process.env.OKX_SECRET || "";
 
 const PASSPHRASE =
-  process.env.OKX_PASSPHRASE || process.env.OKX_API_PASSPHRASE || "";
+  process.env.OKX_PASSPHRASE ||
+  process.env.OKX_API_PASSPHRASE || "";
 
 const PAPER = process.env.PAPER === "1" ? "1" : "0";
 const BASE_URL = (process.env.OKX_API_BASEURL || "https://www.okx.com").trim();
 
-// === Cliente OKX ===
+// --- Cliente HTTP OKX
 const okx = axios.create({ baseURL: BASE_URL, timeout: 15000 });
 
-// === Firma/headers ===
 const isoNow = () => new Date().toISOString();
 
 function sign({ ts, method, path, body = "" }) {
@@ -34,45 +40,45 @@ function sign({ ts, method, path, body = "" }) {
   return hmac.digest("base64");
 }
 
-function headers({ ts, method, path, body }) {
+function hdrs({ ts, method, path, body }) {
   return {
     "OK-ACCESS-KEY": API_KEY,
     "OK-ACCESS-SIGN": sign({ ts, method, path, body }),
     "OK-ACCESS-TIMESTAMP": ts,
     "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-    "x-simulated-trading": PAPER,     // "1"=paper, "0"=real
+    "x-simulated-trading": PAPER, // "1"=paper, "0"=real
     "Content-Type": "application/json",
   };
 }
 
 async function okxGet(path) {
   const ts = isoNow();
-  return okx.get(path, { headers: headers({ ts, method: "GET", path, body: "" }) });
+  return okx.get(path, { headers: hdrs({ ts, method: "GET", path, body: "" }) });
 }
 async function okxPost(path, payload = {}) {
   const ts = isoNow();
   const body = JSON.stringify(payload);
-  return okx.post(path, payload, { headers: headers({ ts, method: "POST", path, body }) });
+  return okx.post(path, payload, { headers: hdrs({ ts, method: "POST", path, body }) });
 }
 
-// === Helpers ===
-function parseNetPos(data = []) {
+// Helpers
+function parseNetPos(rows = []) {
   let net = 0;
   let sample = null;
-  for (const p of data) {
-    if (!sample && p.instId) sample = p;
-    net += Number(p.pos || 0);
+  for (const p of rows) {
+    const sz = Number(p.pos || 0);
+    if (sz) {
+      net += sz;
+      if (!sample) sample = p;
+    }
   }
   return { open: net !== 0, netPosSz: net, sample };
 }
-function oppositeSide(sz) {
-  return Number(sz) > 0 ? "sell" : "buy";
-}
 
-// ================== Endpoints ==================
-app.get("/ping", (_, res) => res.json({ ok: true, service: "okx-exec-proxy" }));
+// -------- Endpoints básicos --------
+app.get("/ping", (_req, res) => res.json({ ok: true, svc: "okx-exec-proxy" }));
 
-app.get("/debug/env", (_, res) => {
+app.get("/debug/env", (_req, res) =>
   res.json({
     ok: true,
     baseURL: BASE_URL,
@@ -80,24 +86,24 @@ app.get("/debug/env", (_, res) => {
     hasSecret: !!SECRET_KEY,
     hasPassphrase: !!PASSPHRASE,
     paper: PAPER,
-  });
-});
+  })
+);
 
 // POST /positions { instId, instType="SWAP" }
 app.post("/positions", async (req, res) => {
   try {
     const { instId, instType = "SWAP" } = req.body || {};
     if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
-
-    const r = await okxGet(`/api/v5/account/positions?instType=${instType}&instId=${encodeURIComponent(instId)}`);
+    const path = `/api/v5/account/positions?instType=${instType}&instId=${encodeURIComponent(instId)}`;
+    const r = await okxGet(path);
     const parsed = parseNetPos(r.data?.data || []);
     res.json({ ok: true, instId, ...parsed, raw: r.data });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err.message, detail: err?.response?.data });
+  } catch (e) {
+    res.status(e?.response?.status || 500).json({ ok: false, error: e.message, detail: e?.response?.data });
   }
 });
 
-// POST /order  (abre posición y admite tp/sl inline)
+// POST /order { instId, side, ordType="market", tdMode="cross", sz, lever?, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx?, posSide? }
 app.post("/order", async (req, res) => {
   try {
     const {
@@ -108,7 +114,6 @@ app.post("/order", async (req, res) => {
     if (!instId || !side || !ordType || !tdMode)
       return res.status(400).json({ ok: false, error: "instId, side, ordType, tdMode required" });
 
-    // Leverage opcional
     let leverageNote = null;
     if (lever) {
       try {
@@ -122,14 +127,14 @@ app.post("/order", async (req, res) => {
     const ord = { instId, side, ordType, tdMode, sz: String(sz ?? "1") };
     if (posSide) ord.posSide = posSide;
     if (tpTriggerPx) ord.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx)     ord.tpOrdPx     = String(tpOrdPx);
+    if (tpOrdPx)     ord.tpOrdPx   = String(tpOrdPx);
     if (slTriggerPx) ord.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx)     ord.slOrdPx     = String(slOrdPx);
+    if (slOrdPx)     ord.slOrdPx   = String(slOrdPx);
 
     const r = await okxPost("/api/v5/trade/order", ord);
     res.json({ ok: true, request: ord, response: r.data, leverageNote });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err.message, detail: err?.response?.data });
+  } catch (e) {
+    res.status(e?.response?.status || 500).json({ ok: false, error: e.message, detail: e?.response?.data });
   }
 });
 
@@ -143,11 +148,11 @@ app.post("/close", async (req, res) => {
     let size = sz;
 
     if (!side || !size || all) {
-      const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
-      const net = parseNetPos(pos.data?.data || []);
+      const r = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+      const net = parseNetPos(r.data?.data || []);
       if (!net.open) return res.json({ ok: true, msg: "No open position" });
       size = String(Math.abs(net.netPosSz));
-      side = oppositeSide(net.netPosSz); // opuesto para cerrar
+      side = net.netPosSz > 0 ? "sell" : "buy"; // opuesto para cerrar
     }
 
     const ord = { instId, tdMode, side, ordType: "market", reduceOnly: "true" };
@@ -156,8 +161,8 @@ app.post("/close", async (req, res) => {
 
     const r = await okxPost("/api/v5/trade/order", ord);
     res.json({ ok: true, request: ord, response: r.data });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err.message, detail: err?.response?.data });
+  } catch (e) {
+    res.status(e?.response?.status || 500).json({ ok: false, error: e.message, detail: e?.response?.data });
   }
 });
 
@@ -167,88 +172,82 @@ app.get("/balance", async (req, res) => {
     const ccy = (req.query.ccy || "USDT").toString();
     const r = await okxGet(`/api/v5/account/balance?ccy=${encodeURIComponent(ccy)}`);
     res.json({ ok: true, ccy, data: r.data });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err.message, detail: err?.response?.data });
+  } catch (e) {
+    res.status(e?.response?.status || 500).json({ ok: false, error: e.message, detail: e?.response?.data });
   }
 });
 
-// --- AMEND TP/SL: cancela existentes y crea nuevos TP/SL como "conditional" ---
+// --- POST /amend-tpsl ---
+// Body: { instId, tdMode="cross", cancelExisting=true|false, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx? }
 app.post("/amend-tpsl", async (req, res) => {
   try {
-    const {
-      instId,
-      tdMode = "cross",
-      posSide,                 // opcional
-      cancelExisting = true,
-      triggerPxType = "last",  // "last" | "mark" | "index"
-      tpTriggerPx, tpOrdPx,
-      slTriggerPx, slOrdPx
-    } = req.body || {};
+    const { instId, tdMode = "cross", cancelExisting, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx } = req.body || {};
+    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
 
-    if (!instId) {
-      return res.status(400).json({ ok: false, error: "instId requerido" });
-    }
+    // 0) Detectar lado de la posición (para side correcto del reduceOnly)
+    const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+    const net = parseNetPos(pos.data?.data || []);
+    const side = net.netPosSz > 0 ? "sell" : "buy"; // long->sell, short->buy
+    if (!net.open) return res.json({ ok: false, error: "No open position to attach TP/SL" });
 
-    // 1) Cancelar algos existentes (TP/SL previos)
+    // 1) Cancelar existentes si se solicita
+    let canceled = [];
     if (cancelExisting) {
-      // Listado de algos pendientes tipo "conditional"
-      const listPath = `/api/v5/trade/orders-algo-pending?instId=${encodeURIComponent(instId)}&ordType=conditional`;
-      const listRes  = await okxGet(listPath);
-      const pending  = listRes.data?.data || [];
-
-      const algosToCancel = pending
+      // Listar algos pendientes (debe ser POST)
+      const list = await okxPost("/api/v5/trade/orders-algo-pending", {
+        instType: "SWAP",
+        instId,
+        ordType: "conditional",
+      });
+      const ids = (list.data?.data || [])
         .filter(a => a.instId === instId && (a.tpTriggerPx || a.slTriggerPx))
-        .map(a => ({ algoId: a.algoId, instId: a.instId }));
+        .map(a => a.algoId);
 
-      if (algosToCancel.length) {
-        // PARA TP/SL se cancela con "cancel-advance-algos" en array
-        await okxPost("/api/v5/trade/cancel-advance-algos", algosToCancel);
+      if (ids.length) {
+        const payload = ids.map(algoId => ({ algoId, instId }));
+        const cancelRes = await okxPost("/api/v5/trade/cancel-algos", payload);
+        canceled = cancelRes.data;
       }
     }
 
-    // 2) Construir nuevo TP/SL. OKX espera un ARRAY de objetos.
+    // 2) Construir nuevo TP/SL
     const algo = {
       instId,
-      tdMode,                // requerido por OKX en muchos modos
+      tdMode,                // requerido por OKX
+      side,                  // correcto según la posición abierta
       ordType: "conditional",
-      reduceOnly: "true",
-      // tipos de disparo
-      tpTriggerPxType: triggerPxType,
-      slTriggerPxType: triggerPxType,
+      reduceOnly: "true",    // para que nunca abra
     };
-    if (posSide) algo.posSide = posSide;
-    if (tpTriggerPx != null) algo.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx     != null) algo.tpOrdPx     = String(tpOrdPx);
-    if (slTriggerPx != null) algo.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx     != null) algo.slOrdPx     = String(slOrdPx);
+    if (tpTriggerPx) algo.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx)     algo.tpOrdPx     = String(tpOrdPx);
+    if (slTriggerPx) algo.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx)     algo.slOrdPx     = String(slOrdPx);
 
-    // Si no llegó ningún nuevo TP/SL, no creamos nada
-    const willPlaceTP = !!algo.tpTriggerPx;
-    const willPlaceSL = !!algo.slTriggerPx;
-    if (!willPlaceTP && !willPlaceSL) {
-      return res.json({ ok: true, msg: "Sin cambios (no se enviaron nuevos TP/SL)" });
+    if (!algo.tpTriggerPx && !algo.slTriggerPx) {
+      return res.json({ ok: true, msg: "Sin cambios: no se enviaron nuevos TP/SL", canceled });
     }
 
-    // IMPORTANTE: enviar ARRAY
-    const placeRes = await okxPost("/api/v5/trade/order-algo", [algo]);
+    // Enviar como OBJETO (no array)
+    const placed = await okxPost("/api/v5/trade/order-algo", algo);
 
     return res.json({
       ok: true,
-      request: { cancelExisting, triggerPxType, tdMode, posSide, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx },
-      response: placeRes.data
+      request: { instId, tdMode, side, cancelExisting, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx },
+      canceled,
+      response: placed.data,
     });
-  } catch (err) {
-    const status = err?.response?.status || 500;
-    const detail = err?.response?.data || err.message || err;
-    console.error("amend-tpsl error:", detail);
-    return res.status(status).json({ ok: false, error: "amend-tpsl failed", detail });
+  } catch (e) {
+    console.error("amend-tpsl error:", e?.response?.data || e?.message || e);
+    res.status(e?.response?.status || 500).json({
+      ok: false,
+      error: e?.response?.data || e?.message || "amend-tpsl failed",
+    });
   }
 });
 
-// === Start ===
+// --- Arranque ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`okx-exec-proxy running on :${PORT}`);
-  console.log(`env baseURL=${BASE_URL} paper=${PAPER} key=${API_KEY ? "✓" : "×"} pass=${PASSPHRASE ? "✓" : "×"}`);
-  console.log("Your service is live");
+  console.log(`env: baseURL=${BASE_URL} paper=${PAPER} key=${API_KEY ? "✓" : "×"} pass=${PASSPHRASE ? "✓" : "×"}`);
 });
