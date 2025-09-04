@@ -69,7 +69,7 @@ async function readNetPosition(instId) {
   const r = await okxGet('/api/v5/account/positions', { instType: 'SWAP', instId });
   const rows = r?.data || [];
   const net = rows.reduce((acc, x) => acc + Number(x.pos || 0), 0);
-  return { rows, netSz: net, tdMode: rows[0]?.mgnMode || 'cross' };
+  return { raw: r, rows, netSz: net, tdMode: rows[0]?.mgnMode || 'cross' };
 }
 const oppositeSideFromNet = (netSz) => (netSz > 0 ? 'sell' : 'buy');
 
@@ -92,13 +92,22 @@ app.get('/debug/env', (_req, res) => {
   });
 });
 
-// 3) Positions
+// 3) Positions (con resumen open/net/side)
 app.post('/positions', async (req, res) => {
   try {
     const { instId } = req.body || {};
     if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
-    const data = await okxGet('/api/v5/account/positions', { instType: 'SWAP', instId });
-    res.json({ ok: true, instId, data });
+
+    const { raw, rows, netSz, tdMode } = await readNetPosition(instId);
+    const open = Number(netSz) !== 0;
+    const side = open ? (netSz > 0 ? 'long' : 'short') : 'flat';
+
+    res.json({
+      ok: true,
+      instId,
+      summary: { open, netSz, side, tdMode },
+      data: raw   // respuesta cruda de OKX para trazabilidad
+    });
   } catch (err) {
     res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
   }
