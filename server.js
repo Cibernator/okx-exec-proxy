@@ -1,10 +1,12 @@
-// server.js
+// server.js (ESM)
 // OKX Exec Proxy v3 — Endpoints: /ping, /debug/env, /positions, /order, /close, /balance, /amend-tpsl
 
-require('dotenv').config();
-const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
+import dotenv from 'dotenv';
+import express from 'express';
+import crypto from 'crypto';
+import axios from 'axios';
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
@@ -21,7 +23,7 @@ const {
 
 /* ===== Axios signed client (OKX v5) ===== */
 function isoTs() {
-  // OKX requires RFC3339/ISO8601 in UTC with milliseconds, e.g. 2024-01-01T00:00:00.000Z
+  // OKX requiere RFC3339/ISO8601 UTC con milisegundos
   return new Date().toISOString();
 }
 
@@ -31,21 +33,15 @@ function signMessage(ts, method, requestPath, body = '') {
 }
 
 async function okxRequest(method, path, { params = undefined, data = undefined } = {}) {
-  const urlObj = new URL(OKX_API_BASEURL);
-  // Build requestPath + query (OKX includes query string in signature)
+  // Construcción de requestPath con query (para firmar GET)
   let requestPath = path;
-  let query = '';
   if (method.toUpperCase() === 'GET' && params && Object.keys(params).length) {
     const qs = new URLSearchParams(params);
-    query = `?${qs.toString()}`;
-    requestPath = `${path}${query}`;
+    requestPath = `${path}?${qs.toString()}`;
   }
 
   const ts = isoTs();
-  const bodyStr =
-    method.toUpperCase() === 'GET'
-      ? ''
-      : (data ? JSON.stringify(data) : '');
+  const bodyStr = method.toUpperCase() === 'GET' ? '' : (data ? JSON.stringify(data) : '');
 
   const headers = {
     'OK-ACCESS-KEY': OKX_API_KEY,
@@ -55,14 +51,14 @@ async function okxRequest(method, path, { params = undefined, data = undefined }
     'Content-Type': 'application/json',
   };
 
-  const instance = axios.create({
+  const client = axios.create({
     baseURL: OKX_API_BASEURL,
-    timeout: 15_000,
+    timeout: 15000,
     headers,
   });
 
-  const resp = await instance.request({
-    url: requestPath, // requestPath (not just path) so GET includes query in URL
+  const resp = await client.request({
+    url: requestPath, // incluir query aquí cuando sea GET
     method,
     data: method.toUpperCase() === 'GET' ? undefined : (data || {}),
   });
@@ -77,7 +73,6 @@ const okxPost = (path, data) => okxRequest('POST', path, { data });
 async function readNetPosition(instId) {
   const r = await okxGet('/api/v5/account/positions', { instType: 'SWAP', instId });
   const rows = r?.data || [];
-  // OKX devuelve array; sumamos pos (string) para netear
   const net = rows.reduce((acc, x) => acc + Number(x.pos || 0), 0);
   return {
     rows,
@@ -87,13 +82,8 @@ async function readNetPosition(instId) {
 }
 
 function oppositeSideFromNet(netSz) {
-  // para cerrar/TP-SL: si estás long (>0), el TP/SL debe ser side "sell"; si short (<0), "buy"
+  // Si estás long (>0) el cierre/TP/SL debe ser "sell"; si short (<0), "buy"
   return netSz > 0 ? 'sell' : 'buy';
-}
-
-function asStrOrNull(v) {
-  if (v === undefined || v === null || v === '') return undefined;
-  return String(v);
 }
 
 /* ===== Endpoints ===== */
@@ -147,7 +137,7 @@ app.post('/order', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'instId, side y sz son obligatorios' });
     }
 
-    // Set leverage (opcional)
+    // Leverage opcional (net)
     if (leverage) {
       await okxPost('/api/v5/account/set-leverage', {
         instId,
@@ -157,7 +147,7 @@ app.post('/order', async (req, res) => {
       });
     }
 
-    // Abrimos orden
+    // Abrimos orden de mercado
     const orderPayload = {
       instId,
       tdMode,
@@ -187,8 +177,7 @@ app.post('/order', async (req, res) => {
       if (slTriggerPx !== undefined) algo.slTriggerPx = String(slTriggerPx);
       if (slOrdPx !== undefined)     algo.slOrdPx     = String(slOrdPx);
 
-      // OKX exige ARRAY
-      tpsl = await okxPost('/api/v5/trade/order-algo', [algo]);
+      tpsl = await okxPost('/api/v5/trade/order-algo', [algo]); // cuerpo es ARRAY
     }
 
     res.json({ ok: true, request: req.body, response: { placed, tpsl } });
@@ -254,16 +243,16 @@ app.post('/amend-tpsl', async (req, res) => {
 
     if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
 
-    // 1) Posición actual
+    // 1) Posición actual y side correcto
     const { netSz } = await readNetPosition(instId);
     if (netSz === 0) return res.status(400).json({ ok: false, error: 'No open position' });
 
     const side = oppositeSideFromNet(netSz);
     const sz = String(Math.abs(netSz));
 
-    // 2) Cancelar existentes
+    // 2) Cancelar algos existentes (usar GET para listar, POST para cancelar)
     if (cancelExisting) {
-      const list = await okxPost('/api/v5/trade/orders-algo-pending', {
+      const list = await okxGet('/api/v5/trade/orders-algo-pending', {
         instType: 'SWAP',
         instId,
         ordType: 'conditional',
@@ -276,7 +265,7 @@ app.post('/amend-tpsl', async (req, res) => {
       }
     }
 
-    // 3) Crear nuevo TP/SL si hay algo que crear
+    // 3) Crear nuevo TP/SL si corresponde
     const hasTP = tpTriggerPx !== undefined || tpOrdPx !== undefined;
     const hasSL = slTriggerPx !== undefined || slOrdPx !== undefined;
 
@@ -293,16 +282,14 @@ app.post('/amend-tpsl', async (req, res) => {
       reduceOnly: 'true',
     };
     if (triggerPxType) algo.triggerPxType = String(triggerPxType);
-
     if (tpTriggerPx !== undefined) algo.tpTriggerPx = String(tpTriggerPx);
     if (tpOrdPx !== undefined)     algo.tpOrdPx     = String(tpOrdPx);
     if (slTriggerPx !== undefined) algo.slTriggerPx = String(slTriggerPx);
     if (slOrdPx !== undefined)     algo.slOrdPx     = String(slOrdPx);
 
-    const placed = await okxPost('/api/v5/trade/order-algo', [algo]);
+    const placed = await okxPost('/api/v5/trade/order-algo', [algo]); // cuerpo es ARRAY
     res.json({ ok: true, request: algo, response: placed });
   } catch (err) {
-    // Log útil en Render
     console.error('amend-tpsl error:', err?.response?.data || err?.message);
     res.status(err?.response?.status || 500).json({
       ok: false,
@@ -314,7 +301,6 @@ app.post('/amend-tpsl', async (req, res) => {
 
 /* ===== Start ===== */
 app.listen(PORT, () => {
-  // Pequeño log para Render
   console.log('okx-exec-proxy running on :' + PORT);
   console.log('env: baseURL=', OKX_API_BASEURL, ' key~', OKX_API_KEY ? '✓' : '×', ' pass~', OKX_API_PASSPHRASE ? '✓' : '×');
 });
