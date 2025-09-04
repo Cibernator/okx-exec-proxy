@@ -1,5 +1,5 @@
 // server.js
-// OKX Exec Proxy v3.1 — Endpoints: /ping, /debug/env, /positions, /order, /close, /balance, /amend-tpsl
+// OKX Exec Proxy v3.2 — Endpoints: /ping, /debug/env, /positions, /order, /close, /balance, /amend-tpsl
 // CommonJS version for Render
 
 require('dotenv').config();
@@ -20,7 +20,7 @@ const {
   PORT = 10000,
 } = process.env;
 
-/* ===== Helpers firma OKX ===== */
+/* ===== Firma OKX ===== */
 const isoTs = () => new Date().toISOString();
 
 function signMessage(ts, method, requestPath, body = '') {
@@ -71,7 +71,23 @@ async function readNetPosition(instId) {
   const net = rows.reduce((acc, x) => acc + Number(x.pos || 0), 0);
   return { raw: r, rows, netSz: net, tdMode: rows[0]?.mgnMode || 'cross' };
 }
+
 const oppositeSideFromNet = (netSz) => (netSz > 0 ? 'sell' : 'buy');
+
+function firstDataItemId(resp, key) {
+  // Extrae el primer id de la lista data: resp.data?.[0]?.[key]
+  try {
+    const id = resp?.data?.[0]?.[key];
+    return id ? String(id) : undefined;
+  } catch { return undefined; }
+}
+
+function arrayIds(resp, key) {
+  try {
+    const arr = resp?.data || [];
+    return arr.map(x => x[key]).filter(Boolean).map(String);
+  } catch { return []; }
+}
 
 /* ===== Endpoints ===== */
 
@@ -92,7 +108,7 @@ app.get('/debug/env', (_req, res) => {
   });
 });
 
-// 3) Positions (con resumen open/net/side)
+// 3) Positions (con resumen open/net/side/tdMode)
 app.post('/positions', async (req, res) => {
   try {
     const { instId } = req.body || {};
@@ -106,14 +122,14 @@ app.post('/positions', async (req, res) => {
       ok: true,
       instId,
       summary: { open, netSz, side, tdMode },
-      data: raw   // respuesta cruda de OKX para trazabilidad
+      data: raw
     });
   } catch (err) {
     res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
   }
 });
 
-// 4) Order (abrir + TP/SL opcional)
+// 4) Order (abrir + TP/SL opcional) — ahora con summary
 app.post('/order', async (req, res) => {
   try {
     const {
@@ -129,6 +145,7 @@ app.post('/order', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'instId, side y sz son obligatorios' });
     }
 
+    // (Opcional) apalancamiento
     if (leverage) {
       await okxPost('/api/v5/account/set-leverage', {
         instId,
@@ -138,6 +155,7 @@ app.post('/order', async (req, res) => {
       });
     }
 
+    // 4.1 Colocar orden spot/swap
     const orderPayload = {
       instId,
       tdMode,
@@ -147,10 +165,15 @@ app.post('/order', async (req, res) => {
       reduceOnly: 'false',
     };
     const placed = await okxPost('/api/v5/trade/order', orderPayload);
+    const ordId = firstDataItemId(placed, 'ordId') || firstDataItemId(placed, 'clOrdId');
 
+    // 4.2 TP/SL opcional (strategy order)
     const hasTP = tpTriggerPx !== undefined || tpOrdPx !== undefined;
     const hasSL = slTriggerPx !== undefined || slOrdPx !== undefined;
+
     let tpsl = null;
+    let tpslSummary = undefined;
+
     if (hasTP || hasSL) {
       const reverseSide = side === 'buy' ? 'sell' : 'buy';
       const ordTypeAlgo = (hasTP && hasSL) ? 'oco' : 'conditional';
@@ -173,16 +196,35 @@ app.post('/order', async (req, res) => {
         if (slOrdPx !== undefined)     algo.slOrdPx     = String(slOrdPx);
         algo.slTriggerPxType = slTriggerPxType;
       }
+
       tpsl = await okxPost('/api/v5/trade/order-algo', algo);
+      const algoIds = arrayIds(tpsl, 'algoId');
+      tpslSummary = {
+        created: tpsl?.code === '0',
+        algoIds,
+        ordType: ordTypeAlgo
+      };
     }
 
-    res.json({ ok: true, request: req.body, response: { placed, tpsl } });
+    const summary = {
+      result: placed?.code === '0' ? 'opened' : 'failed',
+      instId,
+      side,
+      sz: String(sz),
+      ordType,
+      ordId,
+      tpsl: tpslSummary
+    };
+
+    res.json({ ok: placed?.code === '0', summary, request: req.body, data: { placed, tpsl } });
   } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
+    res.status(err?.response?.status || 500).json({
+      ok: false, error: err?.message, detail: err?.response?.data,
+    });
   }
 });
 
-// 5) Close (market reduceOnly)
+// 5) Close (market reduceOnly) — ahora con summary
 app.post('/close', async (req, res) => {
   try {
     const { instId, all, sz, tdMode = 'cross' } = req.body || {};
@@ -204,7 +246,18 @@ app.post('/close', async (req, res) => {
       reduceOnly: 'true',
     };
     const placed = await okxPost('/api/v5/trade/order', payload);
-    res.json({ ok: true, request: payload, response: placed });
+    const ordId = firstDataItemId(placed, 'ordId') || firstDataItemId(placed, 'clOrdId');
+
+    const summary = {
+      result: placed?.code === '0' ? 'closed' : 'failed',
+      instId,
+      side,
+      sz: String(sizeToClose),
+      ordType: 'market',
+      ordId
+    };
+
+    res.json({ ok: placed?.code === '0', summary, request: payload, data: placed });
   } catch (err) {
     res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
   }
@@ -221,7 +274,7 @@ app.get('/balance', async (req, res) => {
   }
 });
 
-// 7) Amend TP/SL
+// 7) Amend TP/SL (amend por algoId o recrear)
 app.post('/amend-tpsl', async (req, res) => {
   try {
     const {
@@ -235,6 +288,7 @@ app.post('/amend-tpsl', async (req, res) => {
 
     if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
 
+    // Posición actual
     const { netSz } = await readNetPosition(instId);
     if (netSz === 0) return res.status(400).json({ ok: false, error: 'No open position' });
 
@@ -244,6 +298,7 @@ app.post('/amend-tpsl', async (req, res) => {
     const hasTP = tpTriggerPx !== undefined || tpOrdPx !== undefined;
     const hasSL = slTriggerPx !== undefined || slOrdPx !== undefined;
 
+    // AMEND directo
     if (algoId) {
       const amendBody = {
         algoId,
@@ -254,9 +309,11 @@ app.post('/amend-tpsl', async (req, res) => {
         ...(hasSL ? { newSlTriggerPxType: slTriggerPxType } : {}),
       };
       const amended = await okxPost('/api/v5/trade/amend-algos', amendBody);
-      return res.json({ ok: amended.code === '0', data: amended, mode: 'amend' });
+      const summary = { result: amended?.code === '0' ? 'amended' : 'failed', instId, algoId };
+      return res.json({ ok: amended?.code === '0', summary, request: amendBody, data: amended, mode: 'amend' });
     }
 
+    // Cancelar existentes (conditional + oco)
     if (cancelExisting) {
       const pendCond = await okxGet('/api/v5/trade/orders-algo-pending', { ordType: 'conditional', instId });
       const pendOco  = await okxGet('/api/v5/trade/orders-algo-pending', { ordType: 'oco', instId });
@@ -269,9 +326,10 @@ app.post('/amend-tpsl', async (req, res) => {
     }
 
     if (!hasTP && !hasSL) {
-      return res.json({ ok: true, msg: 'Sin cambios (no se especificó TP/SL)' });
+      return res.json({ ok: true, summary: { result: 'noop', reason: 'no TP/SL specified' } });
     }
 
+    // Crear nuevo
     const ordTypeAlgo = (hasTP && hasSL) ? 'oco' : 'conditional';
     const place = {
       instId,
@@ -294,7 +352,13 @@ app.post('/amend-tpsl', async (req, res) => {
     }
 
     const created = await okxPost('/api/v5/trade/order-algo', place);
-    res.json({ ok: created.code === '0', request: place, data: created, mode: 'recreate' });
+    const algoIds = arrayIds(created, 'algoId');
+    const summary = {
+      result: created?.code === '0' ? 'recreated' : 'failed',
+      instId, ordType: ordTypeAlgo, algoIds
+    };
+
+    res.json({ ok: created?.code === '0', summary, request: place, data: created, mode: 'recreate' });
   } catch (err) {
     console.error('amend-tpsl error:', err?.response?.data || err?.message);
     res.status(err?.response?.status || 500).json({ ok: false, error: 'amend-tpsl failed', detail: err?.response?.data || err?.message });
