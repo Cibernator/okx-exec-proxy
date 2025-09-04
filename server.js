@@ -1,306 +1,257 @@
-// server.js (ESM)
-// OKX Exec Proxy v3 — Endpoints: /ping, /debug/env, /positions, /order, /close, /balance, /amend-tpsl
+// okx-exec-proxy v3 — server.js (compat vars + baseURL de .env)
+// Fuente original del usuario adaptada para Render y OKX (v5)
 
-import dotenv from 'dotenv';
-import express from 'express';
-import crypto from 'crypto';
-import axios from 'axios';
-
+import express from "express";
+import crypto from "crypto";
+import axios from "axios";
+import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 
-/* ===== Env ===== */
-const {
-  OKX_API_KEY,
-  OKX_API_SECRET,
-  OKX_API_PASSPHRASE,
-  OKX_API_BASEURL = 'https://www.okx.com',
-  NODE_ENV = 'production',
-  PORT = 10000,
-} = process.env;
+// === Variables de entorno (compatibilidad con distintos nombres) ===
+const API_KEY =
+  process.env.OKX_API_KEY ||
+  process.env.OKX_APIKEY ||
+  process.env.OKX_KEY ||
+  "";
 
-/* ===== Axios signed client (OKX v5) ===== */
-function isoTs() {
-  // OKX requiere RFC3339/ISO8601 UTC con milisegundos
-  return new Date().toISOString();
-}
+const SECRET_KEY =
+  process.env.OKX_SECRET_KEY ||
+  process.env.OKX_API_SECRET ||   // <- Render screenshot
+  process.env.OKX_SECRET ||
+  "";
 
-function signMessage(ts, method, requestPath, body = '') {
-  const prehash = ts + method.toUpperCase() + requestPath + body;
-  return crypto.createHmac('sha256', OKX_API_SECRET).update(prehash).digest('base64');
-}
+const PASSPHRASE =
+  process.env.OKX_PASSPHRASE ||
+  process.env.OKX_API_PASSPHRASE || // <- Render screenshot
+  "";
 
-async function okxRequest(method, path, { params = undefined, data = undefined } = {}) {
-  // Construcción de requestPath con query (para firmar GET)
-  let requestPath = path;
-  if (method.toUpperCase() === 'GET' && params && Object.keys(params).length) {
-    const qs = new URLSearchParams(params);
-    requestPath = `${path}?${qs.toString()}`;
-  }
+const PAPER = process.env.PAPER === "1" ? "1" : "0";
 
-  const ts = isoTs();
-  const bodyStr = method.toUpperCase() === 'GET' ? '' : (data ? JSON.stringify(data) : '');
+const BASE_URL =
+  process.env.OKX_API_BASEURL?.trim() || "https://www.okx.com";
 
-  const headers = {
-    'OK-ACCESS-KEY': OKX_API_KEY,
-    'OK-ACCESS-SIGN': signMessage(ts, method, requestPath, bodyStr),
-    'OK-ACCESS-TIMESTAMP': ts,
-    'OK-ACCESS-PASSPHRASE': OKX_API_PASSPHRASE,
-    'Content-Type': 'application/json',
-  };
-
-  const client = axios.create({
-    baseURL: OKX_API_BASEURL,
-    timeout: 15000,
-    headers,
-  });
-
-  const resp = await client.request({
-    url: requestPath, // incluir query aquí cuando sea GET
-    method,
-    data: method.toUpperCase() === 'GET' ? undefined : (data || {}),
-  });
-
-  return resp.data;
-}
-
-const okxGet = (path, params) => okxRequest('GET', path, { params });
-const okxPost = (path, data) => okxRequest('POST', path, { data });
-
-/* ===== Helpers de negocio ===== */
-async function readNetPosition(instId) {
-  const r = await okxGet('/api/v5/account/positions', { instType: 'SWAP', instId });
-  const rows = r?.data || [];
-  const net = rows.reduce((acc, x) => acc + Number(x.pos || 0), 0);
-  return {
-    rows,
-    netSz: net,
-    tdMode: rows[0]?.mgnMode || 'cross',
-  };
-}
-
-function oppositeSideFromNet(netSz) {
-  // Si estás long (>0) el cierre/TP/SL debe ser "sell"; si short (<0), "buy"
-  return netSz > 0 ? 'sell' : 'buy';
-}
-
-/* ===== Endpoints ===== */
-
-// 1) Salud
-app.get('/ping', (_req, res) => {
-  res.json({ ok: true, ts: isoTs() });
+// Cliente OKX
+const okx = axios.create({
+  baseURL: BASE_URL,
+  timeout: 15000,
 });
 
-// 2) Debug env (enmascarado)
-app.get('/debug/env', (_req, res) => {
+// Utils
+const isoNow = () => new Date().toISOString();
+
+function sign({ ts, method, path, body = "" }) {
+  const prehash = `${ts}${method}${path}${body}`;
+  const hmac = crypto.createHmac("sha256", SECRET_KEY);
+  hmac.update(prehash);
+  return hmac.digest("base64");
+}
+
+function headers({ ts, method, path, body }) {
+  return {
+    "OK-ACCESS-KEY": API_KEY,
+    "OK-ACCESS-SIGN": sign({ ts, method, path, body }),
+    "OK-ACCESS-TIMESTAMP": ts,
+    "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+    "x-simulated-trading": PAPER, // "1" = paper, "0" = real
+    "Content-Type": "application/json",
+  };
+}
+
+async function okxGet(path) {
+  const ts = isoNow();
+  return okx.get(path, { headers: headers({ ts, method: "GET", path, body: "" }) });
+}
+
+async function okxPost(path, payload = {}) {
+  const ts = isoNow();
+  const body = JSON.stringify(payload);
+  return okx.post(path, payload, { headers: headers({ ts, method: "POST", path, body }) });
+}
+
+// Helpers
+function parseNetPos(data = []) {
+  let net = 0;
+  let first = null;
+  for (const p of data) {
+    if (p.pos && p.instId) {
+      if (!first) first = p;
+      net += Number(p.pos || 0);
+    }
+  }
+  return { open: net !== 0, netPosSz: net, sample: first || null };
+}
+
+// -------- Endpoints --------
+app.get("/ping", (_, res) => {
+  res.json({ ok: true, service: "okx-exec-proxy" });
+});
+
+app.get("/debug/env", (_, res) => {
   res.json({
     ok: true,
-    env: {
-      baseURL: OKX_API_BASEURL,
-      node: NODE_ENV,
-      hasKey: !!OKX_API_KEY,
-      hasSecret: !!OKX_API_SECRET,
-      hasPassphrase: !!OKX_API_PASSPHRASE,
-    },
+    baseURL: BASE_URL,
+    hasKey: Boolean(API_KEY),
+    hasSecret: Boolean(SECRET_KEY),
+    hasPassphrase: Boolean(PASSPHRASE),
+    paper: PAPER,
   });
 });
 
-// 3) Positions
-// body: { instId: "BTC-USDT-SWAP" }
-app.post('/positions', async (req, res) => {
+// POST /positions  { instId, instType="SWAP" }
+app.post("/positions", async (req, res) => {
   try {
-    const { instId } = req.body || {};
-    if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
-    const data = await okxGet('/api/v5/account/positions', { instType: 'SWAP', instId });
-    res.json({ ok: true, instId, data });
+    const { instId, instType = "SWAP" } = req.body || {};
+    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
+
+    const path = `/api/v5/account/positions?instType=${instType}&instId=${encodeURIComponent(instId)}`;
+    const r = await okxGet(path);
+    const parsed = parseNetPos(r.data?.data || []);
+    res.json({ ok: true, instId, ...parsed, raw: r.data });
   } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data });
   }
 });
 
-// 4) Order (abrir y opcional TP/SL + leverage)
-// body: { instId, side, sz, tdMode="cross", ordType="market", leverage?, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx? }
-app.post('/order', async (req, res) => {
+// POST /order
+// Body: { instId, side, ordType="market", tdMode="cross", sz, lever?, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx?, posSide? }
+app.post("/order", async (req, res) => {
   try {
     const {
-      instId, side, sz,
-      tdMode = 'cross',
-      ordType = 'market',
-      leverage,
-      tpTriggerPx, tpOrdPx,
-      slTriggerPx, slOrdPx,
+      instId, side, ordType = "market", tdMode = "cross", sz,
+      lever, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx, posSide
     } = req.body || {};
 
-    if (!instId || !side || !sz) {
-      return res.status(400).json({ ok: false, error: 'instId, side y sz son obligatorios' });
-    }
+    if (!instId || !side || !ordType || !tdMode)
+      return res.status(400).json({ ok: false, error: "instId, side, ordType, tdMode required" });
 
-    // Leverage opcional (net)
-    if (leverage) {
-      await okxPost('/api/v5/account/set-leverage', {
-        instId,
-        lever: String(leverage),
-        mgnMode: tdMode,
-        posSide: 'net',
-      });
-    }
-
-    // Abrimos orden de mercado
-    const orderPayload = {
-      instId,
-      tdMode,
-      side,
-      ordType,
-      sz: String(sz),
-      reduceOnly: 'false',
-    };
-    const placed = await okxPost('/api/v5/trade/order', orderPayload);
-
-    // TP/SL opcional (advance algo)
-    let tpsl = null;
-    const hasTP = tpTriggerPx !== undefined || tpOrdPx !== undefined;
-    const hasSL = slTriggerPx !== undefined || slOrdPx !== undefined;
-    if (hasTP || hasSL) {
-      const reverseSide = side === 'buy' ? 'sell' : 'buy';
-      const algo = {
-        instId,
-        tdMode,
-        side: reverseSide,
-        sz: String(sz),
-        ordType: 'conditional',
-        reduceOnly: 'true',
-      };
-      if (tpTriggerPx !== undefined) algo.tpTriggerPx = String(tpTriggerPx);
-      if (tpOrdPx !== undefined)     algo.tpOrdPx     = String(tpOrdPx);
-      if (slTriggerPx !== undefined) algo.slTriggerPx = String(slTriggerPx);
-      if (slOrdPx !== undefined)     algo.slOrdPx     = String(slOrdPx);
-
-      tpsl = await okxPost('/api/v5/trade/order-algo', [algo]); // cuerpo es ARRAY
-    }
-
-    res.json({ ok: true, request: req.body, response: { placed, tpsl } });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({
-      ok: false, error: err?.message, detail: err?.response?.data,
-    });
-  }
-});
-
-// 5) Close (market reduceOnly)
-// body: { instId, all?:true | sz?:string, tdMode="cross" }
-app.post('/close', async (req, res) => {
-  try {
-    const { instId, all, sz, tdMode = 'cross' } = req.body || {};
-    if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
-
-    const { netSz } = await readNetPosition(instId);
-    if (netSz === 0) return res.status(400).json({ ok: false, error: 'No hay posición abierta' });
-
-    const side = oppositeSideFromNet(netSz);
-    const sizeToClose = all || !sz ? Math.abs(netSz) : Number(sz);
-    if (!sizeToClose || sizeToClose <= 0) return res.status(400).json({ ok: false, error: 'sz inválido' });
-
-    const payload = {
-      instId,
-      tdMode,
-      side,
-      ordType: 'market',
-      sz: String(sizeToClose),
-      reduceOnly: 'true',
-    };
-    const placed = await okxPost('/api/v5/trade/order', payload);
-    res.json({ ok: true, request: payload, response: placed });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
-  }
-});
-
-// 6) Balance (?ccy=USDT por defecto)
-app.get('/balance', async (req, res) => {
-  try {
-    const ccy = req.query.ccy || 'USDT';
-    const data = await okxGet('/api/v5/account/balance', { ccy });
-    res.json({ ok: true, ccy, data });
-  } catch (err) {
-    res.status(err?.response?.status || 500).json({ ok: false, error: err?.message, detail: err?.response?.data });
-  }
-});
-
-// 7) Amend TP/SL (cancela los actuales y crea nuevos)
-// body: { instId, tdMode="cross", cancelExisting=true, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx?, triggerPxType? }
-app.post('/amend-tpsl', async (req, res) => {
-  try {
-    const {
-      instId,
-      tdMode = 'cross',
-      cancelExisting = true,
-      tpTriggerPx, tpOrdPx,
-      slTriggerPx, slOrdPx,
-      triggerPxType, // "last" | "index" | "mark" (opcional)
-    } = req.body || {};
-
-    if (!instId) return res.status(400).json({ ok: false, error: 'instId requerido' });
-
-    // 1) Posición actual y side correcto
-    const { netSz } = await readNetPosition(instId);
-    if (netSz === 0) return res.status(400).json({ ok: false, error: 'No open position' });
-
-    const side = oppositeSideFromNet(netSz);
-    const sz = String(Math.abs(netSz));
-
-    // 2) Cancelar algos existentes (usar GET para listar, POST para cancelar)
-    if (cancelExisting) {
-      const list = await okxGet('/api/v5/trade/orders-algo-pending', {
-        instType: 'SWAP',
-        instId,
-        ordType: 'conditional',
-      });
-      const pending = list?.data || [];
-      const ids = pending.map(a => a.algoId).filter(Boolean);
-      if (ids.length) {
-        const cancelBody = ids.map(id => ({ algoId: id, instId }));
-        await okxPost('/api/v5/trade/cancel-algos', cancelBody);
+    // 1) leverage (opcional)
+    let leverageNote = null;
+    if (lever) {
+      const levPayload = { instId, lever: String(lever), mgnMode: tdMode };
+      try {
+        const lev = await okxPost("/api/v5/account/set-leverage", levPayload);
+        leverageNote = lev.data;
+      } catch (e) {
+        leverageNote = { warn: "set-leverage failed", reason: e?.response?.data || e.message };
       }
     }
 
-    // 3) Crear nuevo TP/SL si corresponde
-    const hasTP = tpTriggerPx !== undefined || tpOrdPx !== undefined;
-    const hasSL = slTriggerPx !== undefined || slOrdPx !== undefined;
+    // 2) orden
+    const ord = { instId, side, ordType, tdMode, sz: String(sz ?? "1") };
+    if (posSide) ord.posSide = posSide;
+    if (tpTriggerPx) ord.tpTriggerPx = String(tpTriggerPx);
+    if (tpOrdPx) ord.tpOrdPx = String(tpOrdPx);
+    if (slTriggerPx) ord.slTriggerPx = String(slTriggerPx);
+    if (slOrdPx) ord.slOrdPx = String(slOrdPx);
 
-    if (!hasTP && !hasSL) {
-      return res.json({ ok: true, msg: 'Sin cambios (no se especificó TP/SL)' });
-    }
-
-    const algo = {
-      instId,
-      tdMode,
-      side,
-      sz,
-      ordType: 'conditional',
-      reduceOnly: 'true',
-    };
-    if (triggerPxType) algo.triggerPxType = String(triggerPxType);
-    if (tpTriggerPx !== undefined) algo.tpTriggerPx = String(tpTriggerPx);
-    if (tpOrdPx !== undefined)     algo.tpOrdPx     = String(tpOrdPx);
-    if (slTriggerPx !== undefined) algo.slTriggerPx = String(slTriggerPx);
-    if (slOrdPx !== undefined)     algo.slOrdPx     = String(slOrdPx);
-
-    const placed = await okxPost('/api/v5/trade/order-algo', [algo]); // cuerpo es ARRAY
-    res.json({ ok: true, request: algo, response: placed });
+    const r = await okxPost("/api/v5/trade/order", ord);
+    res.json({ ok: true, request: ord, response: r.data, leverageNote });
   } catch (err) {
-    console.error('amend-tpsl error:', err?.response?.data || err?.message);
-    res.status(err?.response?.status || 500).json({
-      ok: false,
-      error: 'amend-tpsl failed',
-      detail: err?.response?.data || err?.message,
-    });
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data });
   }
 });
 
-/* ===== Start ===== */
+// POST /close  { instId, tdMode="cross", side?, sz?, all?, posSide? }
+app.post("/close", async (req, res) => {
+  try {
+    const { instId, tdMode = "cross", all, sz, posSide } = req.body || {};
+    if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
+
+    let side = req.body?.side;
+    let size = sz;
+
+    if (!side || !size || all) {
+      const pos = await okxGet(`/api/v5/account/positions?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+      const rows = pos.data?.data || [];
+      const net = parseNetPos(rows);
+      if (!net.open) return res.json({ ok: true, msg: "No open position" });
+      size = String(Math.abs(net.netPosSz));
+      side = net.netPosSz > 0 ? "sell" : "buy"; // opuesto para cerrar
+    }
+
+    const ord = { instId, tdMode, side, ordType: "market", reduceOnly: "true" };
+    if (!all && size) ord.sz = String(size);
+    if (posSide) ord.posSide = posSide;
+
+    const r = await okxPost("/api/v5/trade/order", ord);
+    res.json({ ok: true, request: ord, response: r.data });
+  } catch (err) {
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data });
+  }
+});
+
+// GET /balance?ccy=USDT
+app.get("/balance", async (req, res) => {
+  try {
+    const ccy = (req.query.ccy || "USDT").toString();
+    const r = await okxGet(`/api/v5/account/balance?ccy=${encodeURIComponent(ccy)}`);
+    res.json({ ok: true, ccy, data: r.data });
+  } catch (err) {
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data });
+  }
+});
+
+// POST /amend-tpsl  { instId, tpTriggerPx?, tpOrdPx?, slTriggerPx?, slOrdPx? }
+app.post("/amend-tpsl", async (req, res) => {
+  const { instId, tpTriggerPx, tpOrdPx, slTriggerPx, slOrdPx } = req.body || {};
+  if (!instId) return res.status(400).json({ ok: false, error: "instId required" });
+
+  try {
+    // 1) cancelar algos pendientes (TP/SL) para este instrumento
+    let cancelNote = null;
+    try {
+      const pend = await okxGet(`/api/v5/trade/orders-algo-pending?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+      const toCancel = (pend.data?.data || [])
+        .filter(x => ["take_profit", "stop_loss", "conditional", "trigger"].includes(String(x.algoType || "").toLowerCase()))
+        .map(x => ({ algoId: x.algoId, instId }));
+      if (toCancel.length) {
+        cancelNote = await okxPost("/api/v5/trade/cancel-advance-algo-orders", toCancel);
+      }
+    } catch (e) {
+      cancelNote = { warn: "cancel advance algos failed", reason: e?.response?.data || e.message };
+    }
+
+    // 2) crear nuevos TP/SL (conditional)
+    let placeNote = null;
+    if (tpTriggerPx || slTriggerPx) {
+      const payload = {
+        instId,
+        tdMode: "cross",
+        ...(tpTriggerPx ? { tpTriggerPx: String(tpTriggerPx) } : {}),
+        ...(tpOrdPx ? { tpOrdPx: String(tpOrdPx) } : {}),
+        ...(slTriggerPx ? { slTriggerPx: String(slTriggerPx) } : {}),
+        ...(slOrdPx ? { slOrdPx: String(slOrdPx) } : {}),
+      };
+      try {
+        placeNote = await okxPost("/api/v5/trade/order-algo", [{ ...payload, ordType: "conditional" }]);
+      } catch (e) {
+        placeNote = { warn: "order-algo failed", reason: e?.response?.data || e.message, tried: payload };
+      }
+    }
+
+    res.json({ ok: true, instId, cancelNote, placeNote });
+  } catch (err) {
+    res
+      .status(err?.response?.status || 500)
+      .json({ ok: false, error: err.message, detail: err?.response?.data });
+  }
+});
+
+// Arranque
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log('okx-exec-proxy running on :' + PORT);
-  console.log('env: baseURL=', OKX_API_BASEURL, ' key~', OKX_API_KEY ? '✓' : '×', ' pass~', OKX_API_PASSPHRASE ? '✓' : '×');
+  console.log(`okx-exec-proxy running on :${PORT}`);
+  console.log(`env: baseURL=${BASE_URL} paper=${PAPER} key=${API_KEY ? "✓" : "×"} pass=${PASSPHRASE ? "✓" : "×"}`);
+  console.log(`Your service is live`);
 });
